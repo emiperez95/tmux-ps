@@ -3,9 +3,49 @@
 
 # Parse arguments
 COMPACT_MODE=false
-if [ "$1" = "--compact" ] || [ "$1" = "-c" ]; then
-    COMPACT_MODE=true
-fi
+WATCH_MODE=false
+INTERVAL=2
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --compact|-c)
+            COMPACT_MODE=true
+            shift
+            ;;
+        --watch|-w)
+            WATCH_MODE=true
+            # Check if next arg is a number (interval)
+            if [[ "$2" =~ ^[0-9]+$ ]]; then
+                INTERVAL="$2"
+                shift
+            fi
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: tmux-ps [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  -c, --compact         Show only high-resource processes (yellow/red)"
+            echo "  -w, --watch [N]       Refresh every N seconds (default: 2)"
+            echo "  -h, --help            Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  tmux-ps                    # Show all processes once"
+            echo "  tmux-ps --compact          # Show only problem processes"
+            echo "  tmux-ps --watch            # Refresh every 2 seconds"
+            echo "  tmux-ps -w 5 -c            # Compact mode, refresh every 5s"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Run 'tmux-ps --help' for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# Trap Ctrl+C for clean exit
+trap 'echo ""; exit 0' INT
 
 # Function to recursively get all descendant PIDs
 get_all_descendants() {
@@ -30,8 +70,10 @@ get_all_descendants() {
     echo "$descendants"
 }
 
-# Get all sessions
-tmux list-sessions -F "#{session_name}" 2>/dev/null | while read -r session; do
+# Main function to show all processes
+show_processes() {
+    # Get all sessions
+    tmux list-sessions -F "#{session_name}" 2>/dev/null | while read -r session; do
     # First pass: collect all PIDs in this session to calculate totals
     session_pids=()
     tmux list-windows -t "$session" -F "#{window_index}" 2>/dev/null | while read -r win_idx; do
@@ -287,4 +329,18 @@ tmux list-sessions -F "#{session_name}" 2>/dev/null | while read -r session; do
         done
     done
     echo ""
-done
+    done
+}
+
+# Run in watch mode or once
+if [ "$WATCH_MODE" = true ]; then
+    while true; do
+        clear
+        echo "tmux-ps - Updated: $(date '+%Y-%m-%d %H:%M:%S') - Refresh: ${INTERVAL}s - Press Ctrl+C to exit"
+        echo ""
+        show_processes
+        sleep "$INTERVAL"
+    done
+else
+    show_processes
+fi

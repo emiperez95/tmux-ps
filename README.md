@@ -9,6 +9,7 @@ A tmux session process monitor with resource usage tracking and color-coded aler
 - **Full process hierarchy**: Shows all descendant processes, not just direct children
 - **Color-coded metrics**: Green/Yellow/Red indicators for CPU and memory usage
 - **Compact mode**: Only shows processes with elevated resource usage (yellow/red)
+- **Watch mode**: Auto-refresh at configurable intervals for live monitoring
 - **Resource tracking**: Real-time CPU% and memory (human-readable format)
 
 ## Installation
@@ -35,9 +36,11 @@ source ~/.zshrc
 
 ## Usage
 
-### Normal mode (show all processes)
+### Show all processes
 ```bash
-tmux-ps
+tmux-ps           # Show once
+tmux-ps --watch   # Auto-refresh every 2 seconds (default)
+tmux-ps -w 5      # Auto-refresh every 5 seconds
 ```
 
 Example output:
@@ -57,12 +60,23 @@ Window 1 (2.1.7) Pane 0 [7 processes, 22.5%/245M]
 
 ### Compact mode (only show problem processes)
 ```bash
-tmux-ps --compact
-# or
-tmux-ps -c
+tmux-ps --compact              # Show once
+tmux-ps -c                     # Short flag
+tmux-ps --watch --compact      # Auto-refresh in compact mode
+tmux-ps -w 3 -c                # Refresh every 3s, compact mode
 ```
 
 In compact mode, only processes with yellow or red CPU/memory usage are shown, making it easy to spot resource hogs.
+
+### Watch mode (live monitoring)
+```bash
+tmux-ps --watch                # Refresh every 2 seconds
+tmux-ps -w                     # Short flag
+tmux-ps -w 10                  # Custom interval (10 seconds)
+tmux-ps -w 5 -c                # Combine with compact mode
+```
+
+Press `Ctrl+C` to exit watch mode.
 
 ## Color Coding
 
