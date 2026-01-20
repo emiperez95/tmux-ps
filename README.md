@@ -9,6 +9,8 @@ A tmux session process monitor with resource usage tracking and color-coded aler
 - **Full process hierarchy**: Shows all descendant processes, not just direct children
 - **Color-coded metrics**: Green/Yellow/Red indicators for CPU and memory usage
 - **Compact mode**: Only shows processes with elevated resource usage (yellow/red)
+- **Ultracompact mode**: Only shows sessions with >2% CPU or >100MB RAM
+- **Session filtering**: Filter sessions by name pattern (case-insensitive, regex support)
 - **Watch mode**: Auto-refresh at configurable intervals for live monitoring
 - **Resource tracking**: Real-time CPU% and memory (human-readable format)
 
@@ -67,6 +69,28 @@ tmux-ps -w 3 -c                # Refresh every 3s, compact mode
 ```
 
 In compact mode, only processes with yellow or red CPU/memory usage are shown, making it easy to spot resource hogs.
+
+### Ultracompact mode (only show busy sessions)
+```bash
+tmux-ps --ultracompact         # Show only sessions with >2% CPU or >100MB RAM
+tmux-ps -u                     # Short flag
+tmux-ps -w 5 -u                # Watch mode + ultracompact
+```
+
+In ultracompact mode:
+- Sessions are filtered: only shown if they have **>2% CPU** OR **>100MB RAM**
+- Within shown sessions, only yellow/red processes are displayed (compact mode)
+- Perfect for quickly identifying resource-heavy sessions
+
+### Filter by session name
+```bash
+tmux-ps --filter worktree      # Show only sessions containing 'worktree'
+tmux-ps -f gene                # Show sessions matching 'gene' (case-insensitive)
+tmux-ps -f "main|scripts"      # Use regex patterns
+tmux-ps -w 3 -u -f work        # Combine with other modes
+```
+
+Filter is case-insensitive and supports regex patterns. Perfect for focusing on specific projects.
 
 ### Watch mode (live monitoring)
 ```bash

@@ -3,14 +3,29 @@
 
 # Parse arguments
 COMPACT_MODE=false
+ULTRACOMPACT_MODE=false
 WATCH_MODE=false
 INTERVAL=2
+FILTER=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --compact|-c)
             COMPACT_MODE=true
             shift
+            ;;
+        --ultracompact|-u)
+            ULTRACOMPACT_MODE=true
+            COMPACT_MODE=true  # Ultracompact implies compact
+            shift
+            ;;
+        --filter|-f)
+            if [ -z "$2" ]; then
+                echo "Error: --filter requires a pattern argument"
+                exit 1
+            fi
+            FILTER="$2"
+            shift 2
             ;;
         --watch|-w)
             WATCH_MODE=true
@@ -26,14 +41,18 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  -c, --compact         Show only high-resource processes (yellow/red)"
+            echo "  -u, --ultracompact    Show only sessions with >2% CPU or >100MB RAM"
+            echo "  -f, --filter PATTERN  Show only sessions matching pattern (case-insensitive)"
             echo "  -w, --watch [N]       Refresh every N seconds (default: 2)"
             echo "  -h, --help            Show this help message"
             echo ""
             echo "Examples:"
             echo "  tmux-ps                    # Show all processes once"
             echo "  tmux-ps --compact          # Show only problem processes"
+            echo "  tmux-ps --ultracompact     # Show only busy sessions"
+            echo "  tmux-ps -f worktree        # Show only sessions with 'worktree' in name"
             echo "  tmux-ps --watch            # Refresh every 2 seconds"
-            echo "  tmux-ps -w 5 -c            # Compact mode, refresh every 5s"
+            echo "  tmux-ps -w 5 -u -f gene    # Ultracompact + filter + watch"
             exit 0
             ;;
         *)
@@ -74,7 +93,14 @@ get_all_descendants() {
 show_processes() {
     # Get all sessions
     tmux list-sessions -F "#{session_name}" 2>/dev/null | while read -r session; do
-    # First pass: collect all PIDs in this session to calculate totals
+        # Apply filter if specified (case-insensitive)
+        if [ -n "$FILTER" ]; then
+            if ! echo "$session" | grep -iq "$FILTER"; then
+                continue  # Skip this session
+            fi
+        fi
+
+        # First pass: collect all PIDs in this session to calculate totals
     session_pids=()
     tmux list-windows -t "$session" -F "#{window_index}" 2>/dev/null | while read -r win_idx; do
         tmux list-panes -t "$session:$win_idx" -F "#{pane_pid}" 2>/dev/null | while read -r pane_pid; do
@@ -125,6 +151,17 @@ show_processes() {
         session_mem_color="\033[31m"  # Red >= 2G
     fi
     reset_color="\033[0m"
+
+    # In ultracompact mode, skip sessions below threshold
+    if [ "$ULTRACOMPACT_MODE" = true ]; then
+        # Skip if CPU <= 2% AND memory <= 100MB (102400 KB)
+        cpu_check=$(awk "BEGIN {print ($total_cpu > 2.0) ? 1 : 0}")
+        mem_check=$((total_mem_kb > 102400 ? 1 : 0))
+
+        if [ "$cpu_check" -eq 0 ] && [ "$mem_check" -eq 0 ]; then
+            continue  # Skip this session entirely
+        fi
+    fi
 
     # Bold session name with totals
     session_totals="${session_cpu_color}${total_cpu}%${reset_color}/${session_mem_color}${total_mem_display}${reset_color}"
