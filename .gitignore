@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Temporary files
+*.swp
+*.swo
+*~
+
+# Test files
+test_*
