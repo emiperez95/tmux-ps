@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::*;
+use crossterm::event::{poll, read, Event, KeyCode, KeyEvent};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -362,10 +364,13 @@ fn main() -> Result<()> {
 
     if let Some(interval) = args.watch {
         loop {
+            // Disable raw mode for display
+            let _ = disable_raw_mode();
+
             print!("\x1B[2J\x1B[1;1H"); // Clear screen
             let now = chrono::Local::now();
             println!(
-                "tmux-ps-rust - Updated: {} - Refresh: {}s - Press Ctrl+C to exit",
+                "tmux-ps-rust - Updated: {} - Refresh: {}s - Press 'R' to refresh, Ctrl+C to exit",
                 now.format("%Y-%m-%d %H:%M:%S"),
                 interval
             );
@@ -375,7 +380,41 @@ fn main() -> Result<()> {
                 eprintln!("Error: {}", e);
             }
 
-            thread::sleep(Duration::from_secs(interval));
+            // Enable raw mode only for input polling
+            enable_raw_mode().context("Failed to enable raw mode")?;
+
+            // Sleep in small intervals, checking for key presses
+            let sleep_ms = 100;
+            let iterations = (interval * 1000) / sleep_ms;
+            let mut should_refresh = false;
+
+            for _ in 0..iterations {
+                if poll(Duration::from_millis(sleep_ms))? {
+                    if let Event::Key(KeyEvent { code, .. }) = read()? {
+                        match code {
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                // Immediate refresh
+                                should_refresh = true;
+                                break;
+                            }
+                            KeyCode::Char('c') if cfg!(unix) => {
+                                // Ctrl+C handled by system, but just in case
+                                let _ = disable_raw_mode();
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            // Disable raw mode after input polling
+            let _ = disable_raw_mode();
+
+            if should_refresh {
+                // Brief pause to avoid too rapid refresh
+                thread::sleep(Duration::from_millis(50));
+            }
         }
     } else {
         display_sessions(&args)?;
