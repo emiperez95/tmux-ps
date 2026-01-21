@@ -24,8 +24,8 @@ A fast tmux session process monitor written in Rust with resource usage tracking
 
 ```bash
 # Clone the repository
-git clone <your-repo-url> ~/Projects/tmux-ps
-cd ~/Projects/tmux-ps
+git clone https://github.com/emiperez95/tmux-ps.git
+cd tmux-ps
 
 # Run the install script (builds and installs)
 ./install.sh
