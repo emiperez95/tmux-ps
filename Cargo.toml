@@ -1,7 +1,11 @@
 [package]
-name = "tmux-ps-rust"
+name = "tmux-ps"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "tmux-ps"
+path = "src/main.rs"
 
 [dependencies]
 sysinfo = "0.32"
