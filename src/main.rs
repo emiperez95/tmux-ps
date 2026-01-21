@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(format_memory(512), "512K");
         assert_eq!(format_memory(1024), "1M");
         assert_eq!(format_memory(2048), "2M");
-        assert_eq!(format_memory(1024 * 1024), "1024M");
+        assert_eq!(format_memory(1024 * 1024), "1.0G");
         assert_eq!(format_memory(1024 * 1024 + 512 * 1024), "1.5G");
     }
 
