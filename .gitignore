@@ -8,3 +8,8 @@
 
 # Test files
 test_*
+
+
+# Added by cargo
+
+/target
