@@ -89,8 +89,30 @@ get_all_descendants() {
     echo "$descendants"
 }
 
+# Helper function to get process info from cache
+get_process_info() {
+    local pid=$1
+    local cache_file=$2
+    # Lookup PID in cache: PID|CPU|MEM|COMM|ARGS
+    grep "^$pid|" "$cache_file" 2>/dev/null
+}
+
 # Main function to show all processes
 show_processes() {
+    # Cache all process info with ONE ps call for performance
+    # Format: PID|CPU|MEM|COMM|ARGS
+    local process_cache="/tmp/tmux-ps-cache-$$"
+    ps -eo pid=,%cpu=,rss=,comm=,args= 2>/dev/null | awk '{
+        pid=$1; cpu=$2; mem=$3; comm=$4
+        $1=$2=$3=$4=""
+        args=$0
+        sub(/^[ \t]+/, "", args)
+        print pid "|" cpu "|" mem "|" comm "|" args
+    }' > "$process_cache"
+
+    # Cleanup cache on exit
+    trap "rm -f $process_cache" EXIT
+
     # Get all sessions
     tmux list-sessions -F "#{session_name}" 2>/dev/null | while read -r session; do
         # Apply filter if specified (case-insensitive)
@@ -115,10 +137,13 @@ show_processes() {
     total_cpu=0
     total_mem_kb=0
     while read -r pid; do
-        cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | xargs)
-        mem=$(ps -p "$pid" -o rss= 2>/dev/null | xargs)
-        [ -n "$cpu" ] && total_cpu=$(awk "BEGIN {printf \"%.1f\", $total_cpu + $cpu}")
-        [ -n "$mem" ] && total_mem_kb=$((total_mem_kb + mem))
+        info=$(get_process_info "$pid" "$process_cache")
+        if [ -n "$info" ]; then
+            cpu=$(echo "$info" | cut -d'|' -f2)
+            mem=$(echo "$info" | cut -d'|' -f3)
+            [ -n "$cpu" ] && total_cpu=$(awk "BEGIN {printf \"%.1f\", $total_cpu + $cpu}")
+            [ -n "$mem" ] && total_mem_kb=$((total_mem_kb + mem))
+        fi
     done < /tmp/tmux-session-pids-$$
     rm -f /tmp/tmux-session-pids-$$
 
@@ -186,15 +211,17 @@ show_processes() {
             if [ -n "$all_pids" ]; then
                 # First pass: collect all process info
                 for pid in $all_pids; do
-                    # Get process info - use separate ps calls for reliability
-                    process_name=$(ps -p "$pid" -o comm= 2>/dev/null | xargs)
-                    cpu_percent=$(ps -p "$pid" -o %cpu= 2>/dev/null | xargs)
-                    mem_kb=$(ps -p "$pid" -o rss= 2>/dev/null | xargs)
-                    process_cmd=$(ps -p "$pid" -o args= 2>/dev/null)
-
-                    if [ -z "$process_name" ]; then
+                    # Get process info from cache (already loaded at start)
+                    info=$(get_process_info "$pid" "$process_cache")
+                    if [ -z "$info" ]; then
                         continue
                     fi
+
+                    # Parse: PID|CPU|MEM|COMM|ARGS
+                    cpu_percent=$(echo "$info" | cut -d'|' -f2)
+                    mem_kb=$(echo "$info" | cut -d'|' -f3)
+                    process_name=$(echo "$info" | cut -d'|' -f4)
+                    process_cmd=$(echo "$info" | cut -d'|' -f5-)
 
                     # Ensure numeric values
                     [ -z "$cpu_percent" ] && cpu_percent="0.0"
@@ -330,10 +357,11 @@ show_processes() {
                 fi
             else
                 # No child processes, just the shell
-                process_name=$(ps -p "$pane_pid" -o comm= 2>/dev/null | xargs)
-                if [ -n "$process_name" ]; then
-                    cpu_percent=$(ps -p "$pane_pid" -o %cpu= 2>/dev/null | xargs)
-                    mem_kb=$(ps -p "$pane_pid" -o rss= 2>/dev/null | xargs)
+                info=$(get_process_info "$pane_pid" "$process_cache")
+                if [ -n "$info" ]; then
+                    cpu_percent=$(echo "$info" | cut -d'|' -f2)
+                    mem_kb=$(echo "$info" | cut -d'|' -f3)
+                    process_name=$(echo "$info" | cut -d'|' -f4)
 
                     # Ensure numeric values
                     [ -z "$cpu_percent" ] && cpu_percent="0.0"
