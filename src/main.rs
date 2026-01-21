@@ -25,6 +25,10 @@ struct Args {
     /// Refresh every N seconds (watch mode)
     #[arg(short, long)]
     watch: Option<u64>,
+
+    /// Show full command names without truncation
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 #[derive(Debug)]
@@ -326,14 +330,14 @@ fn display_sessions(args: &Args) -> Result<()> {
                         let cpu_str = colorize_cpu(proc.cpu_percent);
                         let mem_str = colorize_memory(proc.memory_kb);
 
-                        // Truncate process name and command
-                        let name = if proc.name.len() > 20 {
+                        // Truncate process name and command unless verbose mode is enabled
+                        let name = if !args.verbose && proc.name.len() > 20 {
                             format!("{}...", &proc.name[..17])
                         } else {
                             proc.name.clone()
                         };
 
-                        let cmd = if proc.command.len() > 50 {
+                        let cmd = if !args.verbose && proc.command.len() > 50 {
                             format!("{}...", &proc.command[..47])
                         } else {
                             proc.command.clone()
