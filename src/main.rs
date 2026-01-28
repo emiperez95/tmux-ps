@@ -31,6 +31,14 @@ struct Args {
     /// Show full command names without truncation
     #[arg(short, long)]
     verbose: bool,
+
+    /// Show Claude Code activity status (waiting/thinking/running)
+    #[arg(short, long)]
+    activity: bool,
+
+    /// Show only sessions (no windows/panes/processes)
+    #[arg(short, long)]
+    sessions: bool,
 }
 
 #[derive(Debug)]
@@ -59,6 +67,166 @@ struct ProcessInfo {
     cpu_percent: f32,
     memory_kb: u64,
     command: String,
+}
+
+#[derive(Debug, Clone)]
+enum ClaudeStatus {
+    Waiting,
+    Thinking(String),        // The spinner text (e.g., "Simmering…")
+    RunningTool(String),     // The tool being run (e.g., "Bash")
+    NeedsPermission,
+    Unknown,
+}
+
+impl std::fmt::Display for ClaudeStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClaudeStatus::Waiting => write!(f, "waiting for input"),
+            ClaudeStatus::Thinking(action) => write!(f, "{}", action),
+            ClaudeStatus::RunningTool(tool) => write!(f, "running {}", tool),
+            ClaudeStatus::NeedsPermission => write!(f, "needs permission"),
+            ClaudeStatus::Unknown => write!(f, "active"),
+        }
+    }
+}
+
+/// Check if a process is Claude Code based on name/command
+fn is_claude_process(proc: &ProcessInfo) -> bool {
+    // Claude Code shows up as version numbers like "2.1.20" in pane_current_command
+    // or as "claude" or "node" running claude
+    let name_lower = proc.name.to_lowercase();
+    let cmd_lower = proc.command.to_lowercase();
+
+    // Check for claude in command
+    if cmd_lower.contains("claude") && !cmd_lower.contains("tmux-ps") {
+        return true;
+    }
+
+    // Check for version number pattern (e.g., "2.1.20") which is how claude shows in tmux
+    if proc.name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+        && proc.name.contains('.')
+        && proc.name.chars().filter(|&c| c == '.').count() >= 1
+    {
+        // Likely a version number like "2.1.20"
+        return true;
+    }
+
+    // Check if it's node running something with claude
+    if name_lower == "node" && cmd_lower.contains("claude") {
+        return true;
+    }
+
+    false
+}
+
+/// Capture tmux pane content and detect Claude's current status
+fn get_claude_status(session: &str, window_index: &str, pane_index: &str) -> ClaudeStatus {
+    let target = format!("{}:{}.{}", session, window_index, pane_index);
+
+    let output = Command::new("tmux")
+        .args(&["capture-pane", "-t", &target, "-p", "-S", "-30"])
+        .output();
+
+    let content = match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => return ClaudeStatus::Unknown,
+    };
+
+    parse_claude_status(&content)
+}
+
+/// Parse captured pane content to determine Claude's status
+fn parse_claude_status(content: &str) -> ClaudeStatus {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Search from bottom up for status indicators
+    for line in lines.iter().rev() {
+        let trimmed = line.trim();
+
+        // Check for permission dialog
+        if trimmed.contains("Do you want to proceed?")
+            || trimmed.contains("Do you want to allow")
+            || (trimmed.starts_with("❯ 1.") && trimmed.contains("Yes"))
+        {
+            return ClaudeStatus::NeedsPermission;
+        }
+
+        // Check for running tool (⏺ followed by tool name with parentheses)
+        // Format: "⏺ ToolName(args)" - must have parentheses immediately after tool name
+        // Regular Claude output can also start with ⏺ but won't have the tool(args) pattern
+        if trimmed.starts_with("⏺ ") || trimmed.starts_with("\u{23fa} ") {
+            let rest = trimmed.trim_start_matches("⏺ ").trim_start_matches("\u{23fa} ");
+            // Only treat as tool if it has parentheses (tool call signature)
+            if let Some(paren_pos) = rest.find('(') {
+                let tool = &rest[..paren_pos];
+                // Validate it looks like a tool name:
+                // - Starts with uppercase
+                // - No spaces (tool names are single words like "Bash", "Read", "Explore")
+                // - No special characters like '='
+                if !tool.is_empty()
+                    && tool.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                    && !tool.contains(' ')
+                    && !tool.contains('=')
+                    && tool.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    return ClaudeStatus::RunningTool(tool.to_string());
+                }
+            }
+        }
+
+        // Check for thinking/processing spinners
+        // Patterns: "· Verb…", "✻ Verb…", "✶ Verb…"
+        if (trimmed.starts_with("· ") || trimmed.starts_with("✻ ") || trimmed.starts_with("✶ "))
+            && trimmed.contains('…')
+        {
+            // Extract the action text
+            let action = trimmed
+                .trim_start_matches("· ")
+                .trim_start_matches("✻ ")
+                .trim_start_matches("✶ ");
+
+            // Get just the verb part (before any parentheses)
+            let action = if let Some(paren_pos) = action.find('(') {
+                action[..paren_pos].trim()
+            } else {
+                action.trim()
+            };
+
+            return ClaudeStatus::Thinking(action.to_string());
+        }
+
+        // Check for completed thinking (past tense - "Baked for", "Sautéed for")
+        if trimmed.starts_with("✻ ") && trimmed.contains(" for ") && !trimmed.contains('…') {
+            // Claude finished thinking, now waiting
+            return ClaudeStatus::Waiting;
+        }
+    }
+
+    // Check if there's a prompt at the bottom (waiting for input)
+    // Look for "❯" - could be empty or user is typing
+    for line in lines.iter().rev().take(10) {
+        let trimmed = line.trim();
+
+        // Skip status bar lines
+        if trimmed.contains("| Opus") || trimmed.contains("| Sonnet") || trimmed.contains("| Haiku") {
+            continue;
+        }
+
+        // Skip empty lines and decorative lines
+        if trimmed.is_empty() || trimmed.chars().all(|c| c == '─' || c == '━') {
+            continue;
+        }
+
+        // If we see a prompt (❯), Claude is waiting for input
+        if trimmed.starts_with("❯") {
+            return ClaudeStatus::Waiting;
+        }
+
+        // If we hit any other content, stop looking
+        break;
+    }
+
+    ClaudeStatus::Unknown
 }
 
 fn get_tmux_sessions() -> Result<Vec<TmuxSession>> {
@@ -287,6 +455,57 @@ fn display_sessions(args: &Args) -> Result<()> {
             format_memory(total_mem_kb).red()
         };
 
+        // Sessions-only mode: find Claude status first if needed
+        if args.sessions {
+            let claude_status = if args.activity {
+                // Find first Claude process in any pane
+                let mut found_status: Option<ClaudeStatus> = None;
+                'outer: for window in &session.windows {
+                    for pane in &window.panes {
+                        let mut pane_pids = vec![pane.pid];
+                        get_all_descendants(&sys, pane.pid, &mut pane_pids);
+
+                        for &pid in &pane_pids {
+                            if let Some(info) = get_process_info(&sys, pid) {
+                                if is_claude_process(&info) {
+                                    found_status = Some(get_claude_status(
+                                        &session.name,
+                                        &window.index,
+                                        &pane.index,
+                                    ));
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+                found_status
+            } else {
+                None
+            };
+
+            // Print session header
+            println!(
+                "{} [{}/{}]",
+                session.name.bold(),
+                cpu_colored,
+                mem_colored
+            );
+
+            // Print Claude status on line below if detected
+            if let Some(status) = claude_status {
+                let status_str = match &status {
+                    ClaudeStatus::Waiting => format!("→ {}", status).cyan(),
+                    ClaudeStatus::Thinking(action) => format!("→ {}", action).magenta(),
+                    ClaudeStatus::RunningTool(tool) => format!("→ running {}", tool).yellow(),
+                    ClaudeStatus::NeedsPermission => format!("→ {}", status).red().bold(),
+                    ClaudeStatus::Unknown => format!("→ {}", status).white(),
+                };
+                println!("  {}", status_str);
+            }
+            continue;
+        }
+
         println!(
             "{} [{}/{}]",
             format!("Session: {}", session.name).bold(),
@@ -326,6 +545,27 @@ fn display_sessions(args: &Args) -> Result<()> {
                     pane_mem_str
                 );
 
+                // Check for Claude process and get status if activity flag is set
+                let claude_status = if args.activity {
+                    processes.iter().find(|p| is_claude_process(p)).map(|_| {
+                        get_claude_status(&session.name, &window.index, &pane.index)
+                    })
+                } else {
+                    None
+                };
+
+                // Print Claude status if detected
+                if let Some(status) = &claude_status {
+                    let status_str = match status {
+                        ClaudeStatus::Waiting => format!("→ {}", status).cyan(),
+                        ClaudeStatus::Thinking(action) => format!("→ {}", action).magenta(),
+                        ClaudeStatus::RunningTool(tool) => format!("→ running {}", tool).yellow(),
+                        ClaudeStatus::NeedsPermission => format!("→ {}", status).red().bold(),
+                        ClaudeStatus::Unknown => format!("→ {}", status).white(),
+                    };
+                    println!("  {}", status_str);
+                }
+
                 // Print processes
                 for proc in processes {
                     if should_show_process(proc.cpu_percent, proc.memory_kb, args.compact || args.ultracompact) {
@@ -345,9 +585,16 @@ fn display_sessions(args: &Args) -> Result<()> {
                             proc.command.clone()
                         };
 
+                        // Mark Claude processes
+                        let claude_marker = if args.activity && is_claude_process(&proc) {
+                            " [claude]".cyan().to_string()
+                        } else {
+                            String::new()
+                        };
+
                         println!(
-                            "  └─ PID {} {}/{} ({}) - {}",
-                            proc.pid, cpu_str, mem_str, name, cmd
+                            "  └─ PID {} {}/{} ({}) - {}{}",
+                            proc.pid, cpu_str, mem_str, name, cmd, claude_marker
                         );
                     }
                 }
