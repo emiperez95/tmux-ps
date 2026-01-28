@@ -74,7 +74,8 @@ enum ClaudeStatus {
     Waiting,
     Thinking(String),        // The spinner text (e.g., "Simmering…")
     RunningTool(String),     // The tool being run (e.g., "Bash")
-    NeedsPermission,
+    NeedsPermission(String), // The command requesting permission
+    PlanReview,              // Claude has a plan waiting for approval
     Unknown,
 }
 
@@ -84,11 +85,26 @@ impl std::fmt::Display for ClaudeStatus {
             ClaudeStatus::Waiting => write!(f, "waiting for input"),
             ClaudeStatus::Thinking(action) => write!(f, "{}", action),
             ClaudeStatus::RunningTool(tool) => write!(f, "running {}", tool),
-            ClaudeStatus::NeedsPermission => write!(f, "needs permission"),
+            ClaudeStatus::NeedsPermission(_) => write!(f, "needs permission"),
+            ClaudeStatus::PlanReview => write!(f, "plan ready"),
             ClaudeStatus::Unknown => write!(f, "active"),
         }
     }
 }
+
+/// Info about a displayed session for interactive mode
+#[derive(Debug, Clone)]
+struct SessionInfo {
+    name: String,
+    claude_status: Option<ClaudeStatus>,
+    claude_pane: Option<(String, String, String)>, // (session, window, pane)
+    permission_key: Option<char>,                  // 'y', 'z', 'x', etc. for permission approval
+    total_cpu: f32,                                // cached for display
+    total_mem_kb: u64,                             // cached for display
+}
+
+/// Letter sequence for permission keys (avoiding 'r' for refresh and 'q' for quit)
+const PERMISSION_KEYS: [char; 8] = ['y', 'z', 'x', 'w', 'v', 'u', 't', 's'];
 
 /// Check if a process is Claude Code based on name/command
 fn is_claude_process(proc: &ProcessInfo) -> bool {
@@ -135,20 +151,113 @@ fn get_claude_status(session: &str, window_index: &str, pane_index: &str) -> Cla
     parse_claude_status(&content)
 }
 
+/// Extract the command requesting permission by looking backwards through lines
+fn extract_permission_command(lines: &[&str]) -> String {
+    // First, look for the new permission format: "Bash command" or "Tool command" header
+    // This appears right before the permission dialog
+    for (i, line) in lines.iter().enumerate().rev() {
+        let trimmed = line.trim();
+
+        // Check for "ToolName command" format (e.g., "Bash command", "Read command")
+        // The line may have additional text like "ctrl+e to explain" at the end
+        let tool_command_patterns = ["Bash command", "Read command", "Write command", "Edit command", "Task command", "Glob command", "Grep command"];
+        let found_tool = tool_command_patterns.iter().find(|p| trimmed.starts_with(*p));
+
+        if let Some(pattern) = found_tool {
+            let tool = pattern.trim_end_matches(" command");
+            if !tool.is_empty() && tool.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                // Found tool header, now collect the command lines below it
+                // Skip empty lines at the start, then collect until we hit permission dialog
+                let mut cmd_lines = Vec::new();
+                let mut found_content = false;
+                for j in (i + 1)..lines.len() {
+                    let cmd_line = lines[j].trim();
+                    // Stop at permission dialog markers
+                    if cmd_line.contains("Do you want to proceed")
+                        || cmd_line.contains("Do you want to allow")
+                        || cmd_line.starts_with("❯")
+                    {
+                        break;
+                    }
+                    // Skip leading empty lines, but stop at empty lines after content
+                    if cmd_line.is_empty() {
+                        if found_content {
+                            break;
+                        }
+                        continue;
+                    }
+                    found_content = true;
+                    cmd_lines.push(cmd_line);
+                }
+                if !cmd_lines.is_empty() {
+                    // First line is usually the command, last is often description
+                    let cmd = cmd_lines[0];
+                    let desc = if cmd_lines.len() > 1 {
+                        format!(" ({})", cmd_lines.last().unwrap_or(&""))
+                    } else {
+                        String::new()
+                    };
+                    return format!("{}: {}{}", tool, cmd, desc);
+                }
+            }
+        }
+    }
+
+    // Fallback: look for the old format "⏺ ToolName(command...)"
+    for line in lines.iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("⏺ ") || trimmed.starts_with("\u{23fa} ") {
+            let rest = trimmed.trim_start_matches("⏺ ").trim_start_matches("\u{23fa} ");
+            if let Some(paren_pos) = rest.find('(') {
+                let tool = &rest[..paren_pos];
+                if !tool.is_empty()
+                    && tool.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                    && !tool.contains(' ')
+                    && tool.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    let cmd_start = paren_pos + 1;
+                    let cmd = if let Some(end) = rest.rfind(')') {
+                        &rest[cmd_start..end]
+                    } else {
+                        &rest[cmd_start..]
+                    };
+                    return format!("{}: {}", tool, cmd.trim());
+                }
+            }
+        }
+    }
+    "unknown command".to_string()
+}
+
 /// Parse captured pane content to determine Claude's status
 fn parse_claude_status(content: &str) -> ClaudeStatus {
     let lines: Vec<&str> = content.lines().collect();
 
+    // First pass: check for plan review (look for plan-specific markers)
+    let has_plan_marker = lines.iter().any(|line| {
+        let t = line.trim();
+        t.contains("Here is Claude's plan:") || t.contains("Would you like to proceed?") || t.contains("Ready to code?")
+    });
+
     // Search from bottom up for status indicators
-    for line in lines.iter().rev() {
+    for (i, line) in lines.iter().enumerate().rev() {
         let trimmed = line.trim();
+
+        // Check for plan approval prompt (before permission check)
+        if has_plan_marker
+            && (trimmed.starts_with("❯ 1.") && trimmed.contains("Yes"))
+        {
+            return ClaudeStatus::PlanReview;
+        }
 
         // Check for permission dialog
         if trimmed.contains("Do you want to proceed?")
             || trimmed.contains("Do you want to allow")
             || (trimmed.starts_with("❯ 1.") && trimmed.contains("Yes"))
         {
-            return ClaudeStatus::NeedsPermission;
+            // Look backwards to find the command that needs permission
+            let command = extract_permission_command(&lines[..i]);
+            return ClaudeStatus::NeedsPermission(command);
         }
 
         // Check for running tool (⏺ followed by tool name with parentheses)
@@ -196,7 +305,10 @@ fn parse_claude_status(content: &str) -> ClaudeStatus {
         }
 
         // Check for completed thinking (past tense - "Baked for", "Sautéed for")
-        if trimmed.starts_with("✻ ") && trimmed.contains(" for ") && !trimmed.contains('…') {
+        if (trimmed.starts_with("· ") || trimmed.starts_with("✻ ") || trimmed.starts_with("✶ "))
+            && trimmed.contains(" for ")
+            && !trimmed.contains('…')
+        {
             // Claude finished thinking, now waiting
             return ClaudeStatus::Waiting;
         }
@@ -402,6 +514,186 @@ fn matches_filter(session_name: &str, filter: &Option<String>) -> bool {
     }
 }
 
+/// Display sessions with numbers for interactive selection, returns session info
+fn display_sessions_interactive(args: &Args) -> Result<Vec<SessionInfo>> {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    let sessions = get_tmux_sessions()?;
+    let mut session_infos = Vec::new();
+    let mut display_num = 1;
+    let mut permission_key_idx = 0;
+
+    // First pass: collect all session data
+    for session in sessions {
+        // Apply filter
+        if !matches_filter(&session.name, &args.filter) {
+            continue;
+        }
+
+        // Calculate session totals
+        let mut all_pids = Vec::new();
+        for window in &session.windows {
+            for pane in &window.panes {
+                all_pids.push(pane.pid);
+                get_all_descendants(&sys, pane.pid, &mut all_pids);
+            }
+        }
+
+        let mut total_cpu = 0.0;
+        let mut total_mem_kb = 0u64;
+
+        for &pid in &all_pids {
+            if let Some(info) = get_process_info(&sys, pid) {
+                total_cpu += info.cpu_percent;
+                total_mem_kb += info.memory_kb;
+            }
+        }
+
+        // Apply ultracompact filter
+        if !should_show_session(total_cpu, total_mem_kb, args.ultracompact) {
+            continue;
+        }
+
+        // Find Claude process and status
+        let mut claude_status: Option<ClaudeStatus> = None;
+        let mut claude_pane: Option<(String, String, String)> = None;
+
+        if args.activity {
+            'outer: for window in &session.windows {
+                for pane in &window.panes {
+                    let mut pane_pids = vec![pane.pid];
+                    get_all_descendants(&sys, pane.pid, &mut pane_pids);
+
+                    for &pid in &pane_pids {
+                        if let Some(info) = get_process_info(&sys, pid) {
+                            if is_claude_process(&info) {
+                                claude_status = Some(get_claude_status(
+                                    &session.name,
+                                    &window.index,
+                                    &pane.index,
+                                ));
+                                claude_pane = Some((
+                                    session.name.clone(),
+                                    window.index.clone(),
+                                    pane.index.clone(),
+                                ));
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Assign permission key if this session needs permission
+        let permission_key = if matches!(claude_status, Some(ClaudeStatus::NeedsPermission(_))) {
+            if permission_key_idx < PERMISSION_KEYS.len() {
+                let key = PERMISSION_KEYS[permission_key_idx];
+                permission_key_idx += 1;
+                Some(key)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        session_infos.push(SessionInfo {
+            name: session.name.clone(),
+            claude_status,
+            claude_pane,
+            permission_key,
+            total_cpu,
+            total_mem_kb,
+        });
+    }
+
+    // Second pass: display all sessions
+    for session_info in &session_infos {
+        // Print session header with number
+        let cpu_colored = if session_info.total_cpu < 20.0 {
+            format!("{:.1}%", session_info.total_cpu).green()
+        } else if session_info.total_cpu < 100.0 {
+            format!("{:.1}%", session_info.total_cpu).yellow()
+        } else {
+            format!("{:.1}%", session_info.total_cpu).red()
+        };
+
+        let mem_colored = if session_info.total_mem_kb < 512000 {
+            format_memory(session_info.total_mem_kb).green()
+        } else if session_info.total_mem_kb < 2048000 {
+            format_memory(session_info.total_mem_kb).yellow()
+        } else {
+            format_memory(session_info.total_mem_kb).red()
+        };
+
+        // Show number prefix for interactive selection (1-9)
+        let num_str = if display_num <= 9 {
+            format!("{}.", display_num).bold()
+        } else {
+            "  ".bold()
+        };
+
+        println!(
+            "{} {} [{}/{}]",
+            num_str,
+            session_info.name.bold(),
+            cpu_colored,
+            mem_colored
+        );
+
+        // Print Claude status on line below if detected
+        if let Some(ref status) = session_info.claude_status {
+            match status {
+                ClaudeStatus::NeedsPermission(cmd) => {
+                    // Show with permission key hint using background for visibility
+                    if let Some(key) = session_info.permission_key {
+                        // Truncate command for display
+                        let display_cmd = if cmd.len() > 40 {
+                            format!("{}...", &cmd[..37])
+                        } else {
+                            cmd.clone()
+                        };
+                        println!("   {}", format!("→ [{}/{}] needs permission: {}", key, key.to_ascii_uppercase(), display_cmd).on_yellow().black());
+                    } else {
+                        println!("   {}", "→ needs permission".on_yellow().black());
+                    }
+                }
+                ClaudeStatus::PlanReview => {
+                    println!("   {}", format!("→ {}", status).on_magenta().black());
+                }
+                ClaudeStatus::Waiting => {
+                    println!("   {}", format!("→ {}", status).on_cyan().black());
+                }
+                _ => {
+                    // Thinking, RunningTool, Unknown - all dimmed (don't need attention)
+                    println!("{}", format!("   → {}", status).dimmed());
+                }
+            };
+        }
+
+        display_num += 1;
+    }
+
+    Ok(session_infos)
+}
+
+/// Switch to a tmux session
+fn switch_to_session(session_name: &str) {
+    let _ = Command::new("tmux")
+        .args(&["switch-client", "-t", session_name])
+        .output();
+}
+
+/// Send a key to a tmux pane
+fn send_key_to_pane(session: &str, window: &str, pane: &str, key: &str) {
+    let target = format!("{}:{}.{}", session, window, pane);
+    let _ = Command::new("tmux")
+        .args(&["send-keys", "-t", &target, key])
+        .output();
+}
+
 fn display_sessions(args: &Args) -> Result<()> {
     let mut sys = System::new_all();
     sys.refresh_all();
@@ -494,14 +786,21 @@ fn display_sessions(args: &Args) -> Result<()> {
 
             // Print Claude status on line below if detected
             if let Some(status) = claude_status {
-                let status_str = match &status {
-                    ClaudeStatus::Waiting => format!("→ {}", status).cyan(),
-                    ClaudeStatus::Thinking(action) => format!("→ {}", action).magenta(),
-                    ClaudeStatus::RunningTool(tool) => format!("→ running {}", tool).yellow(),
-                    ClaudeStatus::NeedsPermission => format!("→ {}", status).red().bold(),
-                    ClaudeStatus::Unknown => format!("→ {}", status).white(),
+                match &status {
+                    ClaudeStatus::NeedsPermission(_) => {
+                        println!("  {}", format!("→ {}", status).on_yellow().black());
+                    }
+                    ClaudeStatus::PlanReview => {
+                        println!("  {}", format!("→ {}", status).on_magenta().black());
+                    }
+                    ClaudeStatus::Waiting => {
+                        println!("  {}", format!("→ {}", status).on_cyan().black());
+                    }
+                    _ => {
+                        // Thinking, RunningTool, Unknown - all dimmed (don't need attention)
+                        println!("{}", format!("  → {}", status).dimmed());
+                    }
                 };
-                println!("  {}", status_str);
             }
             continue;
         }
@@ -556,14 +855,21 @@ fn display_sessions(args: &Args) -> Result<()> {
 
                 // Print Claude status if detected
                 if let Some(status) = &claude_status {
-                    let status_str = match status {
-                        ClaudeStatus::Waiting => format!("→ {}", status).cyan(),
-                        ClaudeStatus::Thinking(action) => format!("→ {}", action).magenta(),
-                        ClaudeStatus::RunningTool(tool) => format!("→ running {}", tool).yellow(),
-                        ClaudeStatus::NeedsPermission => format!("→ {}", status).red().bold(),
-                        ClaudeStatus::Unknown => format!("→ {}", status).white(),
+                    match status {
+                        ClaudeStatus::NeedsPermission(_) => {
+                            println!("  {}", format!("→ {}", status).on_yellow().black());
+                        }
+                        ClaudeStatus::PlanReview => {
+                            println!("  {}", format!("→ {}", status).on_magenta().black());
+                        }
+                        ClaudeStatus::Waiting => {
+                            println!("  {}", format!("→ {}", status).on_cyan().black());
+                        }
+                        _ => {
+                            // Thinking, RunningTool, Unknown - all dimmed (don't need attention)
+                            println!("{}", format!("  → {}", status).dimmed());
+                        }
                     };
-                    println!("  {}", status_str);
                 }
 
                 // Print processes
@@ -606,25 +912,49 @@ fn display_sessions(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Find session by permission key
+fn find_session_by_permission_key(sessions: &[SessionInfo], key: char) -> Option<&SessionInfo> {
+    sessions.iter().find(|s| s.permission_key == Some(key.to_ascii_lowercase()))
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
     if let Some(interval) = args.watch {
+        let interactive_mode = args.sessions && args.activity;
+        let mut session_infos: Vec<SessionInfo> = Vec::new();
+
         loop {
             // Disable raw mode for display
             let _ = disable_raw_mode();
 
             print!("\x1B[2J\x1B[1;1H"); // Clear screen
             let now = chrono::Local::now();
-            println!(
-                "tmux-ps-rust - Updated: {} - Refresh: {}s - Press 'R' to refresh, Ctrl+C to exit",
-                now.format("%Y-%m-%d %H:%M:%S"),
-                interval
-            );
+
+            if interactive_mode {
+                println!(
+                    "tmux-ps - {} - {}s - [R]efresh [1-9]switch [Q]uit",
+                    now.format("%H:%M:%S").to_string().dimmed(),
+                    interval
+                );
+            } else {
+                println!(
+                    "tmux-ps - Updated: {} - Refresh: {}s - Press 'R' to refresh, Ctrl+C to exit",
+                    now.format("%Y-%m-%d %H:%M:%S"),
+                    interval
+                );
+            }
             println!();
 
-            if let Err(e) = display_sessions(&args) {
-                eprintln!("Error: {}", e);
+            if interactive_mode {
+                match display_sessions_interactive(&args) {
+                    Ok(infos) => session_infos = infos,
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            } else {
+                if let Err(e) = display_sessions(&args) {
+                    eprintln!("Error: {}", e);
+                }
             }
 
             // Enable raw mode only for input polling
@@ -640,14 +970,42 @@ fn main() -> Result<()> {
                     if let Event::Key(KeyEvent { code, .. }) = read()? {
                         match code {
                             KeyCode::Char('r') | KeyCode::Char('R') => {
-                                // Immediate refresh
                                 should_refresh = true;
                                 break;
                             }
-                            KeyCode::Char('c') if cfg!(unix) => {
-                                // Ctrl+C handled by system, but just in case
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
                                 let _ = disable_raw_mode();
                                 return Ok(());
+                            }
+                            KeyCode::Char('c') if cfg!(unix) => {
+                                let _ = disable_raw_mode();
+                                return Ok(());
+                            }
+                            // Number keys (1-9): switch to session
+                            KeyCode::Char(c) if interactive_mode && c.is_ascii_digit() && c != '0' => {
+                                let idx = c.to_digit(10).unwrap() as usize - 1;
+                                if let Some(session_info) = session_infos.get(idx) {
+                                    switch_to_session(&session_info.name);
+                                }
+                            }
+                            // Letter keys for permission approval
+                            KeyCode::Char(c) if interactive_mode && PERMISSION_KEYS.contains(&c.to_ascii_lowercase()) => {
+                                let is_uppercase = c.is_ascii_uppercase();
+                                if let Some(session_info) = find_session_by_permission_key(&session_infos, c) {
+                                    if let Some((ref sess, ref win, ref pane)) = session_info.claude_pane {
+                                        if is_uppercase {
+                                            // Uppercase = approve always (option 2)
+                                            send_key_to_pane(sess, win, pane, "2");
+                                            send_key_to_pane(sess, win, pane, "Enter");
+                                        } else {
+                                            // Lowercase = approve once (option 1)
+                                            send_key_to_pane(sess, win, pane, "1");
+                                            send_key_to_pane(sess, win, pane, "Enter");
+                                        }
+                                        should_refresh = true;
+                                        break;
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -659,7 +1017,6 @@ fn main() -> Result<()> {
             let _ = disable_raw_mode();
 
             if should_refresh {
-                // Brief pause to avoid too rapid refresh
                 thread::sleep(Duration::from_millis(50));
             }
         }
