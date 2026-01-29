@@ -14,6 +14,22 @@ An interactive Claude Code session dashboard for tmux. Always runs in interactiv
 
 **Usage**: `tmux-claude`, `tmux-claude -w 5`, `tmux-claude -f pattern`
 
+**Keyboard Shortcuts**:
+- `1-9` — Jump to session by number
+- `↑↓` or `j/k` — Navigate selection
+- `Enter` — Switch to selected session
+- `y/Y, z/Z, ...` — Approve permissions (lowercase=once, uppercase=always)
+- `P` + `1-9` — Park session (requires sesh config)
+- `U` — View parked sessions
+- `R` — Refresh
+- `Q` — Quit
+
+**Session Parking** (sesh integration):
+- Park temporarily hides sessions by killing tmux but remembering the name
+- Only sessions with matching sesh configs can be parked
+- Unpark restores via `sesh connect`
+- Parked state persists to `~/.cache/tmux-claude/parked.txt`
+
 ## Shared Architecture
 
 Both tools share the same approach:
@@ -26,7 +42,7 @@ The code is duplicated (not shared as a library) to keep each tool self-containe
 
 ## Technology Stack
 - **Language**: Rust (edition 2021)
-- **Key Dependencies**: `sysinfo`, `clap`, `anyhow`, `chrono`, `crossterm`, `ratatui`
+- **Key Dependencies**: `sysinfo`, `clap`, `anyhow`, `chrono`, `crossterm`, `ratatui`, `dirs`
 
 ## Project Structure
 
