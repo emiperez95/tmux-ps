@@ -65,6 +65,7 @@ enum ClaudeStatus {
     Thinking(String),        // The spinner text (e.g., "Simmering...")
     RunningTool(String),     // The tool being run (e.g., "Bash")
     NeedsPermission(String, Option<String>), // (command, optional description)
+    EditApproval(String),    // Edit file approval dialog (filename)
     PlanReview,              // Claude has a plan waiting for approval
     QuestionAsked,           // Claude asked a question via AskUserQuestion
     Unknown,
@@ -77,6 +78,7 @@ impl std::fmt::Display for ClaudeStatus {
             ClaudeStatus::Thinking(action) => write!(f, "{}", action),
             ClaudeStatus::RunningTool(tool) => write!(f, "running {}", tool),
             ClaudeStatus::NeedsPermission(_, _) => write!(f, "needs permission"),
+            ClaudeStatus::EditApproval(file) => write!(f, "edit: {}", file),
             ClaudeStatus::PlanReview => write!(f, "plan ready"),
             ClaudeStatus::QuestionAsked => write!(f, "question asked"),
             ClaudeStatus::Unknown => write!(f, "active"),
@@ -247,6 +249,17 @@ fn parse_claude_status(content: &str) -> ClaudeStatus {
         // Check for plan approval prompt (before permission check)
         if has_plan_marker && (trimmed.starts_with("❯ 1.") && trimmed.contains("Yes")) {
             return ClaudeStatus::PlanReview;
+        }
+
+        // Check for edit file approval dialog
+        if trimmed.contains("Do you want to make this edit") {
+            // Extract filename from "Do you want to make this edit to Filename.ext?"
+            let filename = trimmed
+                .strip_prefix("Do you want to make this edit to ")
+                .and_then(|s| s.strip_suffix('?'))
+                .unwrap_or("file")
+                .to_string();
+            return ClaudeStatus::EditApproval(filename);
         }
 
         // Check for permission dialog
@@ -741,19 +754,21 @@ impl App {
                 }
             }
 
-            // Assign permission key if this session needs permission
-            let permission_key =
-                if matches!(claude_status, Some(ClaudeStatus::NeedsPermission(_, _))) {
-                    if permission_key_idx < PERMISSION_KEYS.len() {
-                        let key = PERMISSION_KEYS[permission_key_idx];
-                        permission_key_idx += 1;
-                        Some(key)
-                    } else {
-                        None
-                    }
+            // Assign permission key if this session needs permission or edit approval
+            let permission_key = if matches!(
+                claude_status,
+                Some(ClaudeStatus::NeedsPermission(_, _)) | Some(ClaudeStatus::EditApproval(_))
+            ) {
+                if permission_key_idx < PERMISSION_KEYS.len() {
+                    let key = PERMISSION_KEYS[permission_key_idx];
+                    permission_key_idx += 1;
+                    Some(key)
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
 
             session_infos.push(SessionInfo {
                 name: session.name.clone(),
@@ -1280,6 +1295,23 @@ fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui:
                             Style::default().add_modifier(Modifier::DIM),
                         )));
                     }
+                    ClaudeStatus::EditApproval(filename) => {
+                        let text = if let Some(key) = session_info.permission_key {
+                            format!(
+                                "   → [{}/{}] edit: {}",
+                                key,
+                                key.to_ascii_uppercase(),
+                                filename
+                            )
+                        } else {
+                            format!("   → edit: {}", filename)
+                        };
+                        lines.push(Line::from(Span::styled(
+                            text,
+                            Style::default().fg(Color::Yellow),
+                        )));
+                        lines.push(Line::raw(""));
+                    }
                     ClaudeStatus::PlanReview => {
                         lines.push(Line::from(Span::styled(
                             format!("   → {}", status),
@@ -1448,6 +1480,9 @@ fn render_detail_view(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::
             ClaudeStatus::RunningTool(tool) => (format!("running {}", tool), Color::White),
             ClaudeStatus::NeedsPermission(cmd, _) => {
                 (format!("needs permission: {}", cmd), Color::Yellow)
+            }
+            ClaudeStatus::EditApproval(filename) => {
+                (format!("edit approval: {}", filename), Color::Yellow)
             }
             ClaudeStatus::PlanReview => ("plan ready for review".to_string(), Color::Magenta),
             ClaudeStatus::QuestionAsked => ("question asked".to_string(), Color::Magenta),
