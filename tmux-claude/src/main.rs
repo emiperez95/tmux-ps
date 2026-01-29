@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use crossterm::event::{poll, read, Event, KeyCode, KeyEvent};
 use ratatui::{
@@ -8,6 +9,7 @@ use ratatui::{
     widgets::Paragraph,
     DefaultTerminal,
 };
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -39,6 +41,7 @@ struct Args {
 struct TmuxPane {
     index: String,
     pid: u32,
+    cwd: String,
 }
 
 #[derive(Debug)]
@@ -67,27 +70,23 @@ struct ProcessInfo {
 
 #[derive(Debug, Clone)]
 enum ClaudeStatus {
-    Waiting,
-    Thinking(String),        // The spinner text (e.g., "Simmering...")
-    RunningTool(String),     // The tool being run (e.g., "Bash")
-    NeedsPermission(String, Option<String>), // (command, optional description)
-    EditApproval(String),    // Edit file approval dialog (filename)
-    PlanReview,              // Claude has a plan waiting for approval
-    QuestionAsked,           // Claude asked a question via AskUserQuestion
-    Unknown,
+    Waiting,                                  // Idle, waiting for user input
+    NeedsPermission(String, Option<String>),  // (command, optional description)
+    EditApproval(String),                     // Edit file approval dialog (filename)
+    PlanReview,                               // Claude has a plan waiting for approval
+    QuestionAsked,                            // Claude asked a question via AskUserQuestion
+    Unknown,                                  // Working or unknown state
 }
 
 impl std::fmt::Display for ClaudeStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClaudeStatus::Waiting => write!(f, "waiting for input"),
-            ClaudeStatus::Thinking(action) => write!(f, "{}", action),
-            ClaudeStatus::RunningTool(tool) => write!(f, "running {}", tool),
             ClaudeStatus::NeedsPermission(_, _) => write!(f, "needs permission"),
             ClaudeStatus::EditApproval(file) => write!(f, "edit: {}", file),
             ClaudeStatus::PlanReview => write!(f, "plan ready"),
             ClaudeStatus::QuestionAsked => write!(f, "question asked"),
-            ClaudeStatus::Unknown => write!(f, "active"),
+            ClaudeStatus::Unknown => write!(f, "working"),
         }
     }
 }
@@ -101,10 +100,224 @@ struct SessionInfo {
     permission_key: Option<char>,                  // 'y', 'z', 'x', etc. for permission approval
     total_cpu: f32,
     total_mem_kb: u64,
+    last_activity: Option<DateTime<Utc>>,          // timestamp of last jsonl entry
 }
 
 /// Letter sequence for permission keys (avoiding 'r' for refresh, 'q' for quit, 'u' for unparked, 'p' for park)
 const PERMISSION_KEYS: [char; 6] = ['y', 'z', 'x', 'w', 'v', 't'];
+
+// ============================================================================
+// JSONL-based Claude status detection
+// ============================================================================
+
+/// Partial structure for parsing jsonl entries - we only need specific fields
+#[derive(Debug, Deserialize)]
+struct JsonlEntry {
+    #[serde(rename = "type")]
+    entry_type: String,
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
+    message: Option<JsonlMessage>,
+    #[serde(default)]
+    data: Option<JsonlProgressData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonlMessage {
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonlProgressData {
+    #[serde(rename = "hookEvent")]
+    #[serde(default)]
+    hook_event: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolUse {
+    #[serde(rename = "type")]
+    content_type: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+}
+
+/// Result of parsing jsonl for Claude status
+#[derive(Debug)]
+struct JsonlStatus {
+    status: ClaudeStatus,
+    timestamp: Option<DateTime<Utc>>,
+}
+
+/// Convert a project working directory to the Claude projects path
+fn cwd_to_claude_projects_path(cwd: &str) -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    let encoded = cwd.replace('/', "-");
+    home.join(".claude").join("projects").join(encoded)
+}
+
+/// Find the most recently modified jsonl file in a Claude projects directory
+fn find_latest_jsonl(projects_path: &PathBuf) -> Option<PathBuf> {
+    let entries = fs::read_dir(projects_path).ok()?;
+
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "jsonl")
+                .unwrap_or(false)
+        })
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+}
+
+/// Read the last N lines of a file efficiently
+fn read_last_lines(path: &PathBuf, n: usize) -> Vec<String> {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    let reader = BufReader::new(file);
+    let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+
+    lines.into_iter().rev().take(n).collect()
+}
+
+/// Parse Claude status from jsonl file
+fn get_claude_status_from_jsonl(cwd: &str) -> Option<JsonlStatus> {
+    let projects_path = cwd_to_claude_projects_path(cwd);
+    let jsonl_path = find_latest_jsonl(&projects_path)?;
+
+    let last_lines = read_last_lines(&jsonl_path, 10);
+    if last_lines.is_empty() {
+        return None;
+    }
+
+    // Parse entries (they're in reverse order)
+    let mut entries: Vec<JsonlEntry> = last_lines
+        .iter()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+
+    // Reverse to get chronological order
+    entries.reverse();
+
+    // Find the last timestamp
+    let timestamp = entries
+        .iter()
+        .rev()
+        .find_map(|e| e.timestamp.as_ref())
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    // Find the last progress entry to check hook state
+    let last_progress = entries
+        .iter()
+        .rev()
+        .find(|e| e.entry_type == "progress")
+        .and_then(|e| e.data.as_ref())
+        .and_then(|d| d.hook_event.as_ref());
+
+    // Find the last assistant entry with tool_use
+    let last_assistant_tool = entries
+        .iter()
+        .rev()
+        .find(|e| e.entry_type == "assistant")
+        .and_then(|e| e.message.as_ref())
+        .and_then(|m| m.content.as_ref())
+        .and_then(|c| c.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .filter_map(|v| serde_json::from_value::<ToolUse>(v.clone()).ok())
+                .find(|t| t.content_type == "tool_use")
+        });
+
+    // Determine status based on patterns
+    let status = match (last_progress.map(|s| s.as_str()), &last_assistant_tool) {
+        // Tool called, PreToolUse fired, waiting for permission or running
+        (Some("PreToolUse"), Some(tool)) => {
+            let tool_name = tool.name.as_deref().unwrap_or("unknown");
+            match tool_name {
+                "Bash" | "Task" => {
+                    // Extract command and description from input
+                    let (cmd, desc) = tool
+                        .input
+                        .as_ref()
+                        .map(|input| {
+                            let command = input.get("command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown command")
+                                .to_string();
+                            let description = input.get("description")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            (format!("Bash: {}", truncate_command(&command, 60)), description)
+                        })
+                        .unwrap_or(("Bash: unknown".to_string(), None));
+                    ClaudeStatus::NeedsPermission(cmd, desc)
+                }
+                "Write" | "Edit" => {
+                    let file = tool
+                        .input
+                        .as_ref()
+                        .and_then(|input| input.get("file_path"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| extract_filename(s))
+                        .unwrap_or_else(|| "file".to_string());
+                    ClaudeStatus::EditApproval(file)
+                }
+                "ExitPlanMode" => ClaudeStatus::PlanReview,
+                "AskUserQuestion" => ClaudeStatus::QuestionAsked,
+                _ => ClaudeStatus::NeedsPermission(format!("{}: ...", tool_name), None),
+            }
+        }
+        // Turn completed, waiting for input
+        (Some("Stop"), _) => ClaudeStatus::Waiting,
+        (Some("PostToolUse"), _) => ClaudeStatus::Unknown, // Processing/working
+        // No clear signal, assume working
+        _ => ClaudeStatus::Unknown,
+    };
+
+    Some(JsonlStatus { status, timestamp })
+}
+
+/// Truncate a command string for display
+fn truncate_command(cmd: &str, max_len: usize) -> String {
+    if cmd.len() <= max_len {
+        cmd.to_string()
+    } else {
+        format!("{}...", &cmd[..max_len - 3])
+    }
+}
+
+/// Extract filename from a full path
+fn extract_filename(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// Format a duration as human-readable "Xs" or "Xm" or "Xh"
+fn format_duration_ago(timestamp: &DateTime<Utc>) -> String {
+    let now = Utc::now();
+    let duration = now.signed_duration_since(*timestamp);
+
+    let secs = duration.num_seconds();
+    if secs < 0 {
+        return "now".to_string();
+    }
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
 
 /// Check if a process is Claude Code based on name/command
 fn is_claude_process(proc: &ProcessInfo) -> bool {
@@ -130,222 +343,6 @@ fn is_claude_process(proc: &ProcessInfo) -> bool {
     }
 
     false
-}
-
-/// Capture tmux pane content and detect Claude's current status
-fn get_claude_status(session: &str, window_index: &str, pane_index: &str) -> ClaudeStatus {
-    let target = format!("{}:{}.{}", session, window_index, pane_index);
-
-    let output = Command::new("tmux")
-        .args(&["capture-pane", "-t", &target, "-p", "-S", "-30"])
-        .output();
-
-    let content = match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => return ClaudeStatus::Unknown,
-    };
-
-    parse_claude_status(&content)
-}
-
-/// Extract the command requesting permission by looking backwards through lines
-fn extract_permission_command(lines: &[&str]) -> (String, Option<String>) {
-    // First, look for the new permission format: "Bash command" or "Tool command" header
-    for (i, line) in lines.iter().enumerate().rev() {
-        let trimmed = line.trim();
-
-        let tool_command_patterns = [
-            "Bash command",
-            "Read command",
-            "Write command",
-            "Edit command",
-            "Task command",
-            "Glob command",
-            "Grep command",
-        ];
-        let found_tool = tool_command_patterns.iter().find(|p| trimmed.starts_with(*p));
-
-        if let Some(pattern) = found_tool {
-            let tool = pattern.trim_end_matches(" command");
-            if !tool.is_empty() && tool.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
-                let mut cmd_lines = Vec::new();
-                let mut found_content = false;
-                for j in (i + 1)..lines.len() {
-                    let cmd_line = lines[j].trim();
-                    if cmd_line.contains("Do you want to proceed")
-                        || cmd_line.contains("Do you want to allow")
-                        || cmd_line.starts_with("❯")
-                    {
-                        break;
-                    }
-                    if cmd_line.is_empty() {
-                        if found_content {
-                            break;
-                        }
-                        continue;
-                    }
-                    found_content = true;
-                    cmd_lines.push(cmd_line);
-                }
-                if !cmd_lines.is_empty() {
-                    let desc = if cmd_lines.len() > 1 {
-                        Some(cmd_lines.last().unwrap().to_string())
-                    } else {
-                        None
-                    };
-                    let cmd_parts = if cmd_lines.len() > 1 {
-                        &cmd_lines[..cmd_lines.len() - 1]
-                    } else {
-                        &cmd_lines[..]
-                    };
-                    let cmd = format!("{}: {}", tool, cmd_parts.join(" "));
-                    return (cmd, desc);
-                }
-            }
-        }
-    }
-
-    // Fallback: look for the old format "⏺ ToolName(command...)"
-    for line in lines.iter().rev() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("⏺ ") || trimmed.starts_with("\u{23fa} ") {
-            let rest = trimmed.trim_start_matches("⏺ ").trim_start_matches("\u{23fa} ");
-            if let Some(paren_pos) = rest.find('(') {
-                let tool = &rest[..paren_pos];
-                if !tool.is_empty()
-                    && tool.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-                    && !tool.contains(' ')
-                    && tool.chars().all(|c| c.is_alphanumeric() || c == '_')
-                {
-                    let cmd_start = paren_pos + 1;
-                    let cmd = if let Some(end) = rest.rfind(')') {
-                        &rest[cmd_start..end]
-                    } else {
-                        &rest[cmd_start..]
-                    };
-                    return (format!("{}: {}", tool, cmd.trim()), None);
-                }
-            }
-        }
-    }
-    ("unknown command".to_string(), None)
-}
-
-/// Parse captured pane content to determine Claude's status
-fn parse_claude_status(content: &str) -> ClaudeStatus {
-    let lines: Vec<&str> = content.lines().collect();
-
-    // First pass: check for plan review (look for plan-specific markers)
-    let has_plan_marker = lines.iter().any(|line| {
-        let t = line.trim();
-        t.contains("Here is Claude's plan:")
-            || t.contains("Would you like to proceed?")
-            || t.contains("Ready to code?")
-    });
-
-    // Search from bottom up for status indicators
-    for (i, line) in lines.iter().enumerate().rev() {
-        let trimmed = line.trim();
-
-        // Check for AskUserQuestion dialog (always has "Type something." option)
-        if trimmed.contains("Type something.") && trimmed.ends_with('.') {
-            return ClaudeStatus::QuestionAsked;
-        }
-
-        // Check for plan approval prompt (before permission check)
-        if has_plan_marker && (trimmed.starts_with("❯ 1.") && trimmed.contains("Yes")) {
-            return ClaudeStatus::PlanReview;
-        }
-
-        // Check for edit file approval dialog
-        if trimmed.contains("Do you want to make this edit") {
-            // Extract filename from "Do you want to make this edit to Filename.ext?"
-            let filename = trimmed
-                .strip_prefix("Do you want to make this edit to ")
-                .and_then(|s| s.strip_suffix('?'))
-                .unwrap_or("file")
-                .to_string();
-            return ClaudeStatus::EditApproval(filename);
-        }
-
-        // Check for permission dialog
-        if trimmed.contains("Do you want to proceed?")
-            || trimmed.contains("Do you want to allow")
-        {
-            let (command, description) = extract_permission_command(&lines[..i]);
-            return ClaudeStatus::NeedsPermission(command, description);
-        }
-
-        // Check for running tool (⏺ followed by tool name with parentheses)
-        if trimmed.starts_with("⏺ ") || trimmed.starts_with("\u{23fa} ") {
-            let rest = trimmed.trim_start_matches("⏺ ").trim_start_matches("\u{23fa} ");
-            if let Some(paren_pos) = rest.find('(') {
-                let tool = &rest[..paren_pos];
-                if !tool.is_empty()
-                    && tool.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-                    && !tool.contains(' ')
-                    && !tool.contains('=')
-                    && tool.chars().all(|c| c.is_alphanumeric() || c == '_')
-                {
-                    return ClaudeStatus::RunningTool(tool.to_string());
-                }
-            }
-        }
-
-        // Check for thinking/processing spinners
-        if (trimmed.starts_with("· ")
-            || trimmed.starts_with("✻ ")
-            || trimmed.starts_with("✶ "))
-            && trimmed.contains('…')
-        {
-            let action = trimmed
-                .trim_start_matches("· ")
-                .trim_start_matches("✻ ")
-                .trim_start_matches("✶ ");
-
-            let action = if let Some(paren_pos) = action.find('(') {
-                action[..paren_pos].trim()
-            } else {
-                action.trim()
-            };
-
-            return ClaudeStatus::Thinking(action.to_string());
-        }
-
-        // Check for completed thinking (past tense)
-        if (trimmed.starts_with("· ")
-            || trimmed.starts_with("✻ ")
-            || trimmed.starts_with("✶ "))
-            && trimmed.contains(" for ")
-            && !trimmed.contains('…')
-        {
-            return ClaudeStatus::Waiting;
-        }
-    }
-
-    // Check if there's a prompt at the bottom (waiting for input)
-    for line in lines.iter().rev().take(10) {
-        let trimmed = line.trim();
-
-        if trimmed.contains("| Opus")
-            || trimmed.contains("| Sonnet")
-            || trimmed.contains("| Haiku")
-        {
-            continue;
-        }
-
-        if trimmed.is_empty() || trimmed.chars().all(|c| c == '─' || c == '━') {
-            continue;
-        }
-
-        if trimmed.starts_with("❯") {
-            return ClaudeStatus::Waiting;
-        }
-
-        break;
-    }
-
-    ClaudeStatus::Unknown
 }
 
 fn get_tmux_sessions() -> Result<Vec<TmuxSession>> {
@@ -413,7 +410,7 @@ fn get_tmux_panes(session: &str, window_index: &str) -> Result<Vec<TmuxPane>> {
             "-t",
             &target,
             "-F",
-            "#{pane_index} #{pane_pid}",
+            "#{pane_index}\t#{pane_pid}\t#{pane_current_path}",
         ])
         .output()
         .context("Failed to list tmux panes")?;
@@ -426,12 +423,13 @@ fn get_tmux_panes(session: &str, window_index: &str) -> Result<Vec<TmuxPane>> {
             continue;
         }
 
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 3 {
             if let Ok(pid) = parts[1].parse::<u32>() {
                 panes.push(TmuxPane {
                     index: parts[0].to_string(),
                     pid,
+                    cwd: parts[2].to_string(),
                 });
             }
         }
@@ -802,6 +800,7 @@ impl App {
             // Find Claude process and status
             let mut claude_status: Option<ClaudeStatus> = None;
             let mut claude_pane: Option<(String, String, String)> = None;
+            let mut last_activity: Option<DateTime<Utc>> = None;
 
             'outer: for window in &session.windows {
                 for pane in &window.panes {
@@ -811,11 +810,13 @@ impl App {
                     for &pid in &pane_pids {
                         if let Some(info) = get_process_info(&sys, pid) {
                             if is_claude_process(&info) {
-                                claude_status = Some(get_claude_status(
-                                    &session.name,
-                                    &window.index,
-                                    &pane.index,
-                                ));
+                                // Use jsonl-based status detection
+                                if let Some(jsonl_status) = get_claude_status_from_jsonl(&pane.cwd) {
+                                    claude_status = Some(jsonl_status.status);
+                                    last_activity = jsonl_status.timestamp;
+                                } else {
+                                    claude_status = Some(ClaudeStatus::Unknown);
+                                }
                                 claude_pane = Some((
                                     session.name.clone(),
                                     window.index.clone(),
@@ -851,6 +852,7 @@ impl App {
                 permission_key,
                 total_cpu,
                 total_mem_kb,
+                last_activity,
             });
         }
 
@@ -1366,6 +1368,13 @@ fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui:
 
             // Status line
             if let Some(ref status) = session_info.claude_status {
+                // Format "ago" time if available
+                let ago_text = session_info
+                    .last_activity
+                    .as_ref()
+                    .map(|ts| format!(" ({})", format_duration_ago(ts)))
+                    .unwrap_or_default();
+
                 match status {
                     ClaudeStatus::NeedsPermission(cmd, desc) => {
                         let text = if let Some(key) = session_info.permission_key {
@@ -1378,10 +1387,10 @@ fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui:
                         } else {
                             format!("   → needs permission: {}", cmd)
                         };
-                        lines.push(Line::from(Span::styled(
-                            text,
-                            Style::default().fg(Color::Yellow),
-                        )));
+                        lines.push(Line::from(vec![
+                            Span::styled(text, Style::default().fg(Color::Yellow)),
+                            Span::styled(ago_text.clone(), Style::default().add_modifier(Modifier::DIM)),
+                        ]));
                         let desc_text = desc.as_deref().unwrap_or("");
                         lines.push(Line::from(Span::styled(
                             format!("     {}", desc_text),
@@ -1399,38 +1408,38 @@ fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui:
                         } else {
                             format!("   → edit: {}", filename)
                         };
-                        lines.push(Line::from(Span::styled(
-                            text,
-                            Style::default().fg(Color::Yellow),
-                        )));
+                        lines.push(Line::from(vec![
+                            Span::styled(text, Style::default().fg(Color::Yellow)),
+                            Span::styled(ago_text.clone(), Style::default().add_modifier(Modifier::DIM)),
+                        ]));
                         lines.push(Line::raw(""));
                     }
                     ClaudeStatus::PlanReview => {
-                        lines.push(Line::from(Span::styled(
-                            format!("   → {}", status),
-                            Style::default().fg(Color::Magenta),
-                        )));
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("   → {}", status), Style::default().fg(Color::Magenta)),
+                            Span::styled(ago_text.clone(), Style::default().add_modifier(Modifier::DIM)),
+                        ]));
                         lines.push(Line::raw(""));
                     }
                     ClaudeStatus::QuestionAsked => {
-                        lines.push(Line::from(Span::styled(
-                            format!("   → {}", status),
-                            Style::default().fg(Color::Magenta),
-                        )));
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("   → {}", status), Style::default().fg(Color::Magenta)),
+                            Span::styled(ago_text.clone(), Style::default().add_modifier(Modifier::DIM)),
+                        ]));
                         lines.push(Line::raw(""));
                     }
                     ClaudeStatus::Waiting => {
-                        lines.push(Line::from(Span::styled(
-                            format!("   → {}", status),
-                            Style::default().fg(Color::Cyan),
-                        )));
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("   → {}", status), Style::default().fg(Color::Cyan)),
+                            Span::styled(ago_text.clone(), Style::default().add_modifier(Modifier::DIM)),
+                        ]));
                         lines.push(Line::raw(""));
                     }
                     _ => {
-                        lines.push(Line::from(Span::styled(
-                            format!("   → {}", status),
-                            Style::default().add_modifier(Modifier::DIM),
-                        )));
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("   → {}", status), Style::default().add_modifier(Modifier::DIM)),
+                            Span::styled(ago_text.clone(), Style::default().add_modifier(Modifier::DIM)),
+                        ]));
                         lines.push(Line::raw(""));
                     }
                 }
@@ -1569,8 +1578,6 @@ fn render_detail_view(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::
     if let Some(ref status) = session_info.claude_status {
         let (status_text, status_color) = match status {
             ClaudeStatus::Waiting => ("waiting for input".to_string(), Color::Cyan),
-            ClaudeStatus::Thinking(action) => (action.clone(), Color::White),
-            ClaudeStatus::RunningTool(tool) => (format!("running {}", tool), Color::White),
             ClaudeStatus::NeedsPermission(cmd, _) => {
                 (format!("needs permission: {}", cmd), Color::Yellow)
             }
@@ -1579,7 +1586,7 @@ fn render_detail_view(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::
             }
             ClaudeStatus::PlanReview => ("plan ready for review".to_string(), Color::Magenta),
             ClaudeStatus::QuestionAsked => ("question asked".to_string(), Color::Magenta),
-            ClaudeStatus::Unknown => ("active".to_string(), Color::White),
+            ClaudeStatus::Unknown => ("working".to_string(), Color::White),
         };
         lines.push(Line::from(vec![
             Span::styled("Claude: ", Style::default().add_modifier(Modifier::DIM)),

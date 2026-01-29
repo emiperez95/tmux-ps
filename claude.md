@@ -38,6 +38,12 @@ An interactive Claude Code session dashboard for tmux. Always runs in interactiv
 - Unpark restores via `sesh connect`
 - Parked state persists to `~/.cache/tmux-claude/parked.txt`
 
+**Status Detection** (jsonl-based):
+- Reads Claude state directly from `~/.claude/projects/` jsonl files
+- Shows time since last activity: `needs permission (2m ago)`
+- Detects: Waiting, NeedsPermission, EditApproval, PlanReview, QuestionAsked
+- No screen scraping - faster and more reliable than capture-pane
+
 ## Shared Architecture
 
 Both tools share the same approach:
@@ -50,7 +56,7 @@ The code is duplicated (not shared as a library) to keep each tool self-containe
 
 ## Technology Stack
 - **Language**: Rust (edition 2021)
-- **Key Dependencies**: `sysinfo`, `clap`, `anyhow`, `chrono`, `crossterm`, `ratatui`, `dirs`
+- **Key Dependencies**: `sysinfo`, `clap`, `anyhow`, `chrono`, `crossterm`, `ratatui`, `dirs`, `serde`, `serde_json`
 
 ## Project Structure
 
@@ -80,10 +86,10 @@ tmux-claude includes a benchmark tool to measure refresh cycle performance:
 cd tmux-claude && cargo run --release --bin bench
 ```
 
-Typical breakdown (~35ms total with 3 sessions):
-- **tmux discovery** (~60%): list-sessions → list-windows → list-panes chain
-- **capture-pane** (~25%): Pane content capture for Claude status detection
-- **sysinfo** (~15%): System process info for CPU/RAM metrics
+Typical breakdown (~50ms total with 6 sessions):
+- **tmux discovery** (~82%): list-sessions → list-windows → list-panes chain
+- **sysinfo** (~12%): System process info for CPU/RAM metrics
+- **jsonl reading** (~6%): Claude status from project jsonl files
 
 ## Installation
 
