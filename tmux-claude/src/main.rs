@@ -8,6 +8,10 @@ use ratatui::{
     widgets::Paragraph,
     DefaultTerminal,
 };
+use std::collections::HashSet;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use sysinfo::{Pid, System};
@@ -91,8 +95,8 @@ struct SessionInfo {
     total_mem_kb: u64,
 }
 
-/// Letter sequence for permission keys (avoiding 'r' for refresh and 'q' for quit)
-const PERMISSION_KEYS: [char; 8] = ['y', 'z', 'x', 'w', 'v', 'u', 't', 's'];
+/// Letter sequence for permission keys (avoiding 'r' for refresh, 'q' for quit, 'u' for unparked, 'p' for park)
+const PERMISSION_KEYS: [char; 6] = ['y', 'z', 'x', 'w', 'v', 't'];
 
 /// Check if a process is Claude Code based on name/command
 fn is_claude_process(proc: &ProcessInfo) -> bool {
@@ -480,6 +484,72 @@ fn send_key_to_pane(session: &str, window: &str, pane: &str, key: &str) {
         .output();
 }
 
+/// Get the path to the parked sessions file
+fn get_parked_file_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|p| p.join("tmux-claude").join("parked.txt"))
+}
+
+/// Load parked session names from disk
+fn load_parked_sessions() -> HashSet<String> {
+    let Some(path) = get_parked_file_path() else {
+        return HashSet::new();
+    };
+    let Ok(file) = fs::File::open(&path) else {
+        return HashSet::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .collect()
+}
+
+/// Save parked session names to disk
+fn save_parked_sessions(parked: &HashSet<String>) {
+    let Some(path) = get_parked_file_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::File::create(&path) {
+        for name in parked {
+            let _ = writeln!(file, "{}", name);
+        }
+    }
+}
+
+/// Check if a session name has a matching sesh config
+fn has_sesh_config(name: &str) -> bool {
+    Command::new("sesh")
+        .args(["list"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|line| line == name)
+        })
+        .unwrap_or(false)
+}
+
+/// Kill a tmux session
+fn kill_tmux_session(name: &str) -> bool {
+    Command::new("tmux")
+        .args(["kill-session", "-t", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Unpark a session via sesh connect
+fn sesh_connect(name: &str) -> bool {
+    Command::new("sesh")
+        .args(["connect", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Find session by permission key
 fn find_session_by_permission_key(sessions: &[SessionInfo], key: char) -> Option<&SessionInfo> {
     sessions
@@ -508,6 +578,12 @@ struct App {
     selected: usize,
     scroll_offset: usize,
     show_selection: bool,
+    // Parking feature
+    parked_sessions: HashSet<String>,
+    showing_parked: bool,
+    parked_selected: usize,
+    error_message: Option<(String, std::time::Instant)>,
+    awaiting_park_number: bool,
 }
 
 impl App {
@@ -519,6 +595,11 @@ impl App {
             selected: 0,
             scroll_offset: 0,
             show_selection: false,
+            parked_sessions: load_parked_sessions(),
+            showing_parked: false,
+            parked_selected: 0,
+            error_message: None,
+            awaiting_park_number: false,
         }
     }
 
@@ -651,6 +732,64 @@ impl App {
         }
     }
 
+    /// Get sorted list of parked session names
+    fn parked_list(&self) -> Vec<String> {
+        let mut list: Vec<_> = self.parked_sessions.iter().cloned().collect();
+        list.sort();
+        list
+    }
+
+    /// Park a session by index (0-based)
+    fn park_session(&mut self, idx: usize) {
+        if let Some(session_info) = self.session_infos.get(idx) {
+            let name = session_info.name.clone();
+            if !has_sesh_config(&name) {
+                self.error_message = Some((
+                    format!("Cannot park '{}': no sesh config", name),
+                    std::time::Instant::now(),
+                ));
+                return;
+            }
+            if kill_tmux_session(&name) {
+                self.parked_sessions.insert(name.clone());
+                save_parked_sessions(&self.parked_sessions);
+            } else {
+                self.error_message = Some((
+                    format!("Failed to kill session '{}'", name),
+                    std::time::Instant::now(),
+                ));
+            }
+        }
+    }
+
+    /// Unpark the selected parked session
+    fn unpark_selected(&mut self) {
+        let list = self.parked_list();
+        if let Some(name) = list.get(self.parked_selected) {
+            let name = name.clone();
+            if sesh_connect(&name) {
+                self.parked_sessions.remove(&name);
+                save_parked_sessions(&self.parked_sessions);
+                self.showing_parked = false;
+                self.parked_selected = 0;
+            } else {
+                self.error_message = Some((
+                    format!("Failed to unpark '{}'", name),
+                    std::time::Instant::now(),
+                ));
+            }
+        }
+    }
+
+    /// Clear error message if it's older than 3 seconds
+    fn clear_old_error(&mut self) {
+        if let Some((_, instant)) = &self.error_message {
+            if instant.elapsed() > std::time::Duration::from_secs(3) {
+                self.error_message = None;
+            }
+        }
+    }
+
     fn ensure_visible(&mut self, available_height: usize) {
         if available_height == 0 || self.session_infos.is_empty() {
             return;
@@ -675,19 +814,29 @@ impl App {
 
 /// Build the ratatui UI
 fn ui(frame: &mut ratatui::Frame, app: &mut App) {
+    app.clear_old_error();
     let area = frame.area();
 
+    // Determine if we need an error line
+    let error_height = if app.error_message.is_some() { 1 } else { 0 };
+
     let chunks = Layout::vertical([
-        Constraint::Length(1), // header
-        Constraint::Min(0),   // session list
-        Constraint::Length(1), // footer
+        Constraint::Length(1),           // header
+        Constraint::Min(0),              // session list
+        Constraint::Length(error_height), // error message (if any)
+        Constraint::Length(1),           // footer
     ])
     .split(area);
 
     // --- Header ---
     let now = chrono::Local::now();
+    let title = if app.showing_parked {
+        "tmux-claude [PARKED]"
+    } else {
+        "tmux-claude"
+    };
     let header = Line::from(vec![
-        Span::styled("tmux-claude", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(
             now.format("%H:%M:%S").to_string(),
@@ -701,8 +850,70 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     ]);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
-    // --- Session list ---
-    let available_height = chunks[1].height as usize;
+    // --- Session list or parked list ---
+    if app.showing_parked {
+        render_parked_view(frame, app, chunks[1]);
+    } else {
+        render_session_list(frame, app, chunks[1]);
+    }
+
+    // --- Error message ---
+    if let Some((ref msg, _)) = app.error_message {
+        let error_line = Line::from(Span::styled(
+            msg.clone(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        frame.render_widget(Paragraph::new(error_line), chunks[2]);
+    }
+
+    // --- Footer ---
+    let footer = if app.showing_parked {
+        Line::from(vec![
+            Span::styled("[a-z]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("select "),
+            Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("unpark "),
+            Span::styled("[U/Esc]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("back "),
+            Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("uit"),
+        ])
+    } else if app.awaiting_park_number {
+        Line::from(vec![
+            Span::styled("[1-9]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("park session "),
+            Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("cancel"),
+        ])
+    } else {
+        let parked_count = app.parked_sessions.len();
+        let mut spans = vec![
+            Span::styled("[↑↓]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("select "),
+            Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("switch "),
+            Span::styled("[P+#]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("ark "),
+        ];
+        if parked_count > 0 {
+            spans.push(Span::styled("[U]", Style::default().add_modifier(Modifier::BOLD)));
+            spans.push(Span::raw(format!("parked({}) ", parked_count)));
+        } else {
+            spans.push(Span::styled("[U]", Style::default().add_modifier(Modifier::DIM)));
+            spans.push(Span::styled("parked ", Style::default().add_modifier(Modifier::DIM)));
+        }
+        spans.push(Span::styled("[R]", Style::default().add_modifier(Modifier::BOLD)));
+        spans.push(Span::raw("efresh "));
+        spans.push(Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)));
+        spans.push(Span::raw("uit"));
+        Line::from(spans)
+    };
+    frame.render_widget(Paragraph::new(footer), chunks[3]);
+}
+
+/// Render the normal session list view
+fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let available_height = area.height as usize;
 
     // Adjust scroll_offset so the selected session is visible
     app.ensure_visible(available_height);
@@ -745,10 +956,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
 
         // Prefix: ">" for selected, number for others
         let prefix_span = if is_selected {
-            Span::styled(
-                ">",
-                Style::default().add_modifier(Modifier::BOLD),
-            )
+            Span::styled(">", Style::default().add_modifier(Modifier::BOLD))
         } else if display_num <= 9 {
             Span::styled(
                 format!("{}", display_num),
@@ -860,30 +1068,59 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         idx += 1;
     }
 
-    frame.render_widget(Paragraph::new(lines), chunks[1]);
+    frame.render_widget(Paragraph::new(lines), area);
+}
 
-    // --- Footer ---
-    let footer = Line::from(vec![
-        Span::styled("[↑↓]", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("select "),
-        Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("switch "),
-        Span::styled("[R]", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("efresh "),
-        Span::styled("[1-9]", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("jump "),
-        Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("uit"),
-    ]);
-    frame.render_widget(Paragraph::new(footer), chunks[2]);
+/// Render the parked sessions view
+fn render_parked_view(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let parked_list = app.parked_list();
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::raw("")); // Spacing after header
+
+    if parked_list.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No parked sessions",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    } else {
+        for (i, name) in parked_list.iter().enumerate() {
+            let letter = (b'a' + i as u8) as char;
+            let is_selected = i == app.parked_selected;
+
+            let prefix = if is_selected {
+                Span::styled(">", Style::default().add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(
+                    format!("{}", letter),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )
+            };
+
+            let style = if is_selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+
+            lines.push(Line::from(vec![
+                prefix,
+                Span::styled(". ", style),
+                Span::styled(name.clone(), style),
+            ]));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
     let mut app = App::new(&args);
 
     loop {
-        // 1. Gather data
-        app.refresh()?;
+        // 1. Gather data (only when not showing parked view)
+        if !app.showing_parked {
+            app.refresh()?;
+        }
 
         // 2. Draw UI
         terminal.draw(|frame| ui(frame, &mut app))?;
@@ -897,72 +1134,146 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
         for _ in 0..iterations {
             if poll(Duration::from_millis(sleep_ms))? {
                 if let Event::Key(KeyEvent { code, .. }) = read()? {
-                    match code {
-                        // Navigation
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.move_selection_up();
-                            needs_redraw = true;
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            app.move_selection_down();
-                            needs_redraw = true;
-                        }
-                        // Enter: switch to selected session
-                        KeyCode::Enter => {
-                            if app.show_selection {
-                                if let Some(session_info) = app.session_infos.get(app.selected) {
-                                    switch_to_session(&session_info.name);
+                    // Handle parked view input
+                    if app.showing_parked {
+                        match code {
+                            KeyCode::Char('u') | KeyCode::Char('U') | KeyCode::Esc => {
+                                app.showing_parked = false;
+                                app.parked_selected = 0;
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                return Ok(());
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if app.parked_selected > 0 {
+                                    app.parked_selected -= 1;
                                 }
-                                app.hide_selection();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let count = app.parked_list().len();
+                                if count > 0 && app.parked_selected < count - 1 {
+                                    app.parked_selected += 1;
+                                }
+                                needs_redraw = true;
+                            }
+                            KeyCode::Enter => {
+                                app.unpark_selected();
+                                should_refresh = true;
+                                break;
+                            }
+                            // Letter keys (a-z) to select parked session
+                            KeyCode::Char(c) if c.is_ascii_lowercase() => {
+                                let idx = (c as u8 - b'a') as usize;
+                                let count = app.parked_list().len();
+                                if idx < count {
+                                    app.parked_selected = idx;
+                                    needs_redraw = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if app.awaiting_park_number {
+                        // Handle park number input
+                        match code {
+                            KeyCode::Esc => {
+                                app.awaiting_park_number = false;
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                                let idx = c.to_digit(10).unwrap() as usize - 1;
+                                app.park_session(idx);
+                                app.awaiting_park_number = false;
+                                should_refresh = true;
+                                break;
+                            }
+                            _ => {
+                                app.awaiting_park_number = false;
                                 needs_redraw = true;
                             }
                         }
-                        KeyCode::Char('r') | KeyCode::Char('R') => {
-                            should_refresh = true;
-                            break;
-                        }
-                        KeyCode::Char('q') | KeyCode::Char('Q') => {
-                            return Ok(());
-                        }
-                        KeyCode::Char('c') if cfg!(unix) => {
-                            return Ok(());
-                        }
-                        // Number keys (1-9): switch to session
-                        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                            let idx = c.to_digit(10).unwrap() as usize - 1;
-                            if let Some(session_info) = app.session_infos.get(idx) {
-                                switch_to_session(&session_info.name);
-                                app.hide_selection();
+                    } else {
+                        // Normal mode input
+                        match code {
+                            // Navigation
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.move_selection_up();
                                 needs_redraw = true;
                             }
-                        }
-                        // Letter keys for permission approval
-                        KeyCode::Char(c)
-                            if PERMISSION_KEYS.contains(&c.to_ascii_lowercase()) =>
-                        {
-                            let is_uppercase = c.is_ascii_uppercase();
-                            if let Some(session_info) =
-                                find_session_by_permission_key(&app.session_infos, c)
-                            {
-                                if let Some((ref sess, ref win, ref pane)) =
-                                    session_info.claude_pane
-                                {
-                                    if is_uppercase {
-                                        // Uppercase = approve always (option 2)
-                                        send_key_to_pane(sess, win, pane, "2");
-                                        send_key_to_pane(sess, win, pane, "Enter");
-                                    } else {
-                                        // Lowercase = approve once (option 1)
-                                        send_key_to_pane(sess, win, pane, "1");
-                                        send_key_to_pane(sess, win, pane, "Enter");
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.move_selection_down();
+                                needs_redraw = true;
+                            }
+                            // Enter: switch to selected session
+                            KeyCode::Enter => {
+                                if app.show_selection {
+                                    if let Some(session_info) = app.session_infos.get(app.selected)
+                                    {
+                                        switch_to_session(&session_info.name);
                                     }
                                     app.hide_selection();
-                                    should_refresh = true;
-                                    break;
+                                    needs_redraw = true;
                                 }
                             }
+                            // P: enter park mode (wait for number)
+                            KeyCode::Char('p') | KeyCode::Char('P') => {
+                                app.awaiting_park_number = true;
+                                needs_redraw = true;
+                            }
+                            // U: show parked view
+                            KeyCode::Char('u') | KeyCode::Char('U') => {
+                                app.showing_parked = true;
+                                app.parked_selected = 0;
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                should_refresh = true;
+                                break;
+                            }
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                return Ok(());
+                            }
+                            KeyCode::Char('c') if cfg!(unix) => {
+                                return Ok(());
+                            }
+                            // Number keys (1-9): switch to session
+                            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                                let idx = c.to_digit(10).unwrap() as usize - 1;
+                                if let Some(session_info) = app.session_infos.get(idx) {
+                                    switch_to_session(&session_info.name);
+                                    app.hide_selection();
+                                    needs_redraw = true;
+                                }
+                            }
+                            // Letter keys for permission approval (excluding p and u)
+                            KeyCode::Char(c)
+                                if PERMISSION_KEYS.contains(&c.to_ascii_lowercase()) =>
+                            {
+                                let is_uppercase = c.is_ascii_uppercase();
+                                if let Some(session_info) =
+                                    find_session_by_permission_key(&app.session_infos, c)
+                                {
+                                    if let Some((ref sess, ref win, ref pane)) =
+                                        session_info.claude_pane
+                                    {
+                                        if is_uppercase {
+                                            // Uppercase = approve always (option 2)
+                                            send_key_to_pane(sess, win, pane, "2");
+                                            send_key_to_pane(sess, win, pane, "Enter");
+                                        } else {
+                                            // Lowercase = approve once (option 1)
+                                            send_key_to_pane(sess, win, pane, "1");
+                                            send_key_to_pane(sess, win, pane, "Enter");
+                                        }
+                                        app.hide_selection();
+                                        should_refresh = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
 
                     // Redraw immediately after navigation keys
