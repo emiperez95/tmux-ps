@@ -12,17 +12,25 @@ A fast tmux session process monitor that displays resource usage for all process
 ### tmux-claude (`tmux-claude/`)
 An interactive Claude Code session dashboard for tmux. Always runs in interactive mode with auto-refresh. Shows all tmux sessions with Claude activity detection, permission approval via keyboard shortcuts, and session switching.
 
-**Usage**: `tmux-claude`, `tmux-claude -w 5`, `tmux-claude -f pattern`
+**Usage**: `tmux-claude`, `tmux-claude -w 5`, `tmux-claude -f pattern`, `tmux-claude --popup`
 
 **Keyboard Shortcuts**:
-- `1-9` — Jump to session by number
+- `1-9` — Jump to session by number (exits in popup mode)
 - `↑↓` or `j/k` — Navigate selection
 - `Enter` — Switch to selected session
 - `y/Y, z/Z, ...` — Approve permissions (lowercase=once, uppercase=always)
 - `P` + `1-9` — Park session (requires sesh config)
 - `U` — View parked sessions
 - `R` — Refresh
+- `Esc` — Quit (popup mode only)
 - `Q` — Quit
+
+**Popup Mode** (`--popup` / `-p`):
+- Designed for use with `tmux display-popup`
+- Exits automatically after switching sessions (1-9)
+- Escape key closes the popup
+- Skips session restore prompt on startup
+- Example tmux binding: `bind-key d display-popup -E -w 80% -h 70% "tmux-claude --popup"`
 
 **Session Parking** (sesh integration):
 - Park temporarily hides sessions by killing tmux but remembering the name
@@ -79,7 +87,14 @@ Typical breakdown (~35ms total with 3 sessions):
 
 ## Installation
 
-Each tool has its own `install.sh` that builds and installs to `~/.local/bin/`:
+Install to `~/.local/bin/` using cargo:
+
+```bash
+cd tmux-ps && cargo install --path . --root ~/.local
+cd tmux-claude && cargo install --path . --root ~/.local
+```
+
+Or use the legacy install scripts:
 
 ```bash
 cd tmux-ps && ./install.sh      # installs tmux-ps

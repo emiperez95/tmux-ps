@@ -29,6 +29,10 @@ struct Args {
     /// Refresh interval in seconds (default: 1)
     #[arg(short, long, default_value = "1")]
     watch: u64,
+
+    /// Popup mode: exit after switching sessions (for use with tmux display-popup)
+    #[arg(short, long)]
+    popup: bool,
 }
 
 #[derive(Debug)]
@@ -716,6 +720,8 @@ struct App {
     selected: usize,
     scroll_offset: usize,
     show_selection: bool,
+    // Popup mode: exit after switching sessions
+    popup_mode: bool,
     // Parking feature
     parked_sessions: HashMap<String, String>, // name → note
     showing_parked: bool,
@@ -744,6 +750,7 @@ impl App {
             selected: 0,
             scroll_offset: 0,
             show_selection: false,
+            popup_mode: args.popup,
             parked_sessions: load_parked_sessions(),
             showing_parked: false,
             parked_selected: 0,
@@ -1867,6 +1874,9 @@ fn run(terminal: &mut DefaultTerminal, args: Args, running: Arc<AtomicBool>) -> 
                                 app.save_restorable();
                                 return Ok(());
                             }
+                            KeyCode::Esc if app.popup_mode => {
+                                return Ok(());
+                            }
                             KeyCode::Char('c') if cfg!(unix) => {
                                 app.save_restorable();
                                 return Ok(());
@@ -1876,6 +1886,10 @@ fn run(terminal: &mut DefaultTerminal, args: Args, running: Arc<AtomicBool>) -> 
                                 let idx = c.to_digit(10).unwrap() as usize - 1;
                                 if let Some(session_info) = app.session_infos.get(idx) {
                                     switch_to_session(&session_info.name);
+                                    if app.popup_mode {
+                                        app.save_restorable();
+                                        return Ok(());
+                                    }
                                     app.hide_selection();
                                     needs_redraw = true;
                                 }
@@ -1928,47 +1942,49 @@ fn run(terminal: &mut DefaultTerminal, args: Args, running: Arc<AtomicBool>) -> 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Check for sessions to restore BEFORE starting TUI
-    let saved = load_restorable_sessions();
-    let current = get_current_tmux_session_names();
-    let to_restore: Vec<_> = saved
-        .into_iter()
-        .filter(|name| !current.contains(name))
-        .collect();
+    // Check for sessions to restore BEFORE starting TUI (skip in popup mode)
+    if !args.popup {
+        let saved = load_restorable_sessions();
+        let current = get_current_tmux_session_names();
+        let to_restore: Vec<_> = saved
+            .into_iter()
+            .filter(|name| !current.contains(name))
+            .collect();
 
-    if !to_restore.is_empty() {
-        println!("Found {} session(s) to restore:", to_restore.len());
-        for name in &to_restore {
-            println!("  - {}", name);
-        }
-        print!("Restore all? [Y/n] ");
-        std::io::stdout().flush().ok();
+        if !to_restore.is_empty() {
+            println!("Found {} session(s) to restore:", to_restore.len());
+            for name in &to_restore {
+                println!("  - {}", name);
+            }
+            print!("Restore all? [Y/n] ");
+            std::io::stdout().flush().ok();
 
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_ok() {
-            let input = input.trim().to_lowercase();
-            if input.is_empty() || input == "y" || input == "yes" {
-                // Remember current session to switch back after restore
-                let original_session = get_current_tmux_session();
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_ok() {
+                let input = input.trim().to_lowercase();
+                if input.is_empty() || input == "y" || input == "yes" {
+                    // Remember current session to switch back after restore
+                    let original_session = get_current_tmux_session();
 
-                println!("Restoring sessions...");
-                for name in &to_restore {
-                    if sesh_connect(name) {
-                        println!("  ✓ {}", name);
-                    } else {
-                        println!("  ✗ {} (failed)", name);
+                    println!("Restoring sessions...");
+                    for name in &to_restore {
+                        if sesh_connect(name) {
+                            println!("  ✓ {}", name);
+                        } else {
+                            println!("  ✗ {} (failed)", name);
+                        }
                     }
-                }
 
-                // Switch back to original session
-                if let Some(ref original) = original_session {
-                    switch_to_session(original);
-                }
+                    // Switch back to original session
+                    if let Some(ref original) = original_session {
+                        switch_to_session(original);
+                    }
 
-                // Brief pause to let sessions stabilize
-                std::thread::sleep(Duration::from_millis(500));
-            } else {
-                println!("Skipping restore.");
+                    // Brief pause to let sessions stabilize
+                    std::thread::sleep(Duration::from_millis(500));
+                } else {
+                    println!("Skipping restore.");
+                }
             }
         }
     }
