@@ -62,6 +62,7 @@ enum ClaudeStatus {
     RunningTool(String),     // The tool being run (e.g., "Bash")
     NeedsPermission(String, Option<String>), // (command, optional description)
     PlanReview,              // Claude has a plan waiting for approval
+    QuestionAsked,           // Claude asked a question via AskUserQuestion
     Unknown,
 }
 
@@ -73,6 +74,7 @@ impl std::fmt::Display for ClaudeStatus {
             ClaudeStatus::RunningTool(tool) => write!(f, "running {}", tool),
             ClaudeStatus::NeedsPermission(_, _) => write!(f, "needs permission"),
             ClaudeStatus::PlanReview => write!(f, "plan ready"),
+            ClaudeStatus::QuestionAsked => write!(f, "question asked"),
             ClaudeStatus::Unknown => write!(f, "active"),
         }
     }
@@ -233,6 +235,11 @@ fn parse_claude_status(content: &str) -> ClaudeStatus {
     for (i, line) in lines.iter().enumerate().rev() {
         let trimmed = line.trim();
 
+        // Check for AskUserQuestion dialog (always has "Type something." option)
+        if trimmed.contains("Type something.") && trimmed.ends_with('.') {
+            return ClaudeStatus::QuestionAsked;
+        }
+
         // Check for plan approval prompt (before permission check)
         if has_plan_marker && (trimmed.starts_with("❯ 1.") && trimmed.contains("Yes")) {
             return ClaudeStatus::PlanReview;
@@ -241,7 +248,6 @@ fn parse_claude_status(content: &str) -> ClaudeStatus {
         // Check for permission dialog
         if trimmed.contains("Do you want to proceed?")
             || trimmed.contains("Do you want to allow")
-            || (trimmed.starts_with("❯ 1.") && trimmed.contains("Yes"))
         {
             let (command, description) = extract_permission_command(&lines[..i]);
             return ClaudeStatus::NeedsPermission(command, description);
@@ -799,6 +805,13 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
                         )));
                     }
                     ClaudeStatus::PlanReview => {
+                        lines.push(Line::from(Span::styled(
+                            format!("   → {}", status),
+                            Style::default().fg(Color::Magenta),
+                        )));
+                        lines.push(Line::raw(""));
+                    }
+                    ClaudeStatus::QuestionAsked => {
                         lines.push(Line::from(Span::styled(
                             format!("   → {}", status),
                             Style::default().fg(Color::Magenta),
