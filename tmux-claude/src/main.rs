@@ -708,7 +708,8 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     app.ensure_visible(available_height);
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut lines_remaining = available_height;
+    lines.push(Line::raw("")); // Spacing after header
+    let mut lines_remaining = available_height.saturating_sub(1);
     let mut idx = app.scroll_offset;
 
     while idx < app.session_infos.len() {
