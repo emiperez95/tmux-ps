@@ -26,7 +26,7 @@ The code is duplicated (not shared as a library) to keep each tool self-containe
 
 ## Technology Stack
 - **Language**: Rust (edition 2021)
-- **Key Dependencies**: `sysinfo`, `clap`, `colored`, `anyhow`, `chrono`, `crossterm`
+- **Key Dependencies**: `sysinfo`, `clap`, `anyhow`, `chrono`, `crossterm`, `ratatui`
 
 ## Project Structure
 
@@ -40,11 +40,26 @@ tmux-ps/                  (repo root)
 │   └── README.md
 ├── tmux-claude/          (Claude dashboard)
 │   ├── Cargo.toml
-│   ├── src/main.rs
+│   ├── src/
+│   │   ├── main.rs
+│   │   └── bin/bench.rs  (benchmark tool)
 │   └── install.sh
-├── claude.md             (this file)
+├── CLAUDE.md             (this file)
 └── .gitignore
 ```
+
+## Performance
+
+tmux-claude includes a benchmark tool to measure refresh cycle performance:
+
+```bash
+cd tmux-claude && cargo run --release --bin bench
+```
+
+Typical breakdown (~35ms total with 3 sessions):
+- **tmux discovery** (~60%): list-sessions → list-windows → list-panes chain
+- **capture-pane** (~25%): Pane content capture for Claude status detection
+- **sysinfo** (~15%): System process info for CPU/RAM metrics
 
 ## Installation
 
