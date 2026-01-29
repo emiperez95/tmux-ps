@@ -11,5 +11,4 @@ test_*
 
 
 # Added by cargo
-
-/target
+**/target
