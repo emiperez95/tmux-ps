@@ -8,7 +8,7 @@ use ratatui::{
     widgets::Paragraph,
     DefaultTerminal,
 };
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -489,23 +489,31 @@ fn get_parked_file_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|p| p.join("tmux-claude").join("parked.txt"))
 }
 
-/// Load parked session names from disk
-fn load_parked_sessions() -> HashSet<String> {
+/// Load parked sessions from disk (name → note)
+fn load_parked_sessions() -> HashMap<String, String> {
     let Some(path) = get_parked_file_path() else {
-        return HashSet::new();
+        return HashMap::new();
     };
     let Ok(file) = fs::File::open(&path) else {
-        return HashSet::new();
+        return HashMap::new();
     };
     BufReader::new(file)
         .lines()
         .map_while(Result::ok)
         .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            // Format: "session-name\tnote" or just "session-name" (for backwards compat)
+            if let Some((name, note)) = line.split_once('\t') {
+                (name.to_string(), note.to_string())
+            } else {
+                (line, String::new())
+            }
+        })
         .collect()
 }
 
-/// Save parked session names to disk
-fn save_parked_sessions(parked: &HashSet<String>) {
+/// Save parked sessions to disk (tab-separated: name\tnote)
+fn save_parked_sessions(parked: &HashMap<String, String>) {
     let Some(path) = get_parked_file_path() else {
         return;
     };
@@ -513,8 +521,8 @@ fn save_parked_sessions(parked: &HashSet<String>) {
         let _ = fs::create_dir_all(parent);
     }
     if let Ok(mut file) = fs::File::create(&path) {
-        for name in parked {
-            let _ = writeln!(file, "{}", name);
+        for (name, note) in parked {
+            let _ = writeln!(file, "{}\t{}", name, note);
         }
     }
 }
@@ -571,6 +579,12 @@ fn lines_for_session(session: &SessionInfo) -> usize {
 // App state & ratatui rendering
 // ---------------------------------------------------------------------------
 
+#[derive(PartialEq)]
+enum InputMode {
+    Normal,
+    ParkNote, // Entering note for parking
+}
+
 struct App {
     session_infos: Vec<SessionInfo>,
     filter: Option<String>,
@@ -579,11 +593,15 @@ struct App {
     scroll_offset: usize,
     show_selection: bool,
     // Parking feature
-    parked_sessions: HashSet<String>,
+    parked_sessions: HashMap<String, String>, // name → note
     showing_parked: bool,
     parked_selected: usize,
     error_message: Option<(String, std::time::Instant)>,
     awaiting_park_number: bool,
+    // Text input for park note
+    input_mode: InputMode,
+    input_buffer: String,
+    pending_park_session: Option<usize>, // session index to park after note entry
 }
 
 impl App {
@@ -600,6 +618,9 @@ impl App {
             parked_selected: 0,
             error_message: None,
             awaiting_park_number: false,
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            pending_park_session: None,
         }
     }
 
@@ -732,15 +753,19 @@ impl App {
         }
     }
 
-    /// Get sorted list of parked session names
-    fn parked_list(&self) -> Vec<String> {
-        let mut list: Vec<_> = self.parked_sessions.iter().cloned().collect();
-        list.sort();
+    /// Get sorted list of parked sessions (name, note)
+    fn parked_list(&self) -> Vec<(String, String)> {
+        let mut list: Vec<_> = self
+            .parked_sessions
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        list.sort_by(|a, b| a.0.cmp(&b.0));
         list
     }
 
-    /// Park a session by index (0-based)
-    fn park_session(&mut self, idx: usize) {
+    /// Start parking a session - validates sesh config and enters note input mode
+    fn start_park_session(&mut self, idx: usize) {
         if let Some(session_info) = self.session_infos.get(idx) {
             let name = session_info.name.clone();
             if !has_sesh_config(&name) {
@@ -750,22 +775,45 @@ impl App {
                 ));
                 return;
             }
-            if kill_tmux_session(&name) {
-                self.parked_sessions.insert(name.clone());
-                save_parked_sessions(&self.parked_sessions);
-            } else {
-                self.error_message = Some((
-                    format!("Failed to kill session '{}'", name),
-                    std::time::Instant::now(),
-                ));
+            // Enter note input mode
+            self.input_mode = InputMode::ParkNote;
+            self.input_buffer.clear();
+            self.pending_park_session = Some(idx);
+        }
+    }
+
+    /// Complete parking a session with the given note
+    fn complete_park_session(&mut self) {
+        if let Some(idx) = self.pending_park_session.take() {
+            if let Some(session_info) = self.session_infos.get(idx) {
+                let name = session_info.name.clone();
+                let note = self.input_buffer.trim().to_string();
+                if kill_tmux_session(&name) {
+                    self.parked_sessions.insert(name.clone(), note);
+                    save_parked_sessions(&self.parked_sessions);
+                } else {
+                    self.error_message = Some((
+                        format!("Failed to kill session '{}'", name),
+                        std::time::Instant::now(),
+                    ));
+                }
             }
         }
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
+    /// Cancel note input and return to normal mode
+    fn cancel_park_input(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+        self.pending_park_session = None;
     }
 
     /// Unpark the selected parked session
     fn unpark_selected(&mut self) {
         let list = self.parked_list();
-        if let Some(name) = list.get(self.parked_selected) {
+        if let Some((name, _note)) = list.get(self.parked_selected) {
             let name = name.clone();
             if sesh_connect(&name) {
                 self.parked_sessions.remove(&name);
@@ -867,7 +915,19 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     }
 
     // --- Footer ---
-    let footer = if app.showing_parked {
+    let footer = if app.input_mode == InputMode::ParkNote {
+        // Note input mode footer
+        Line::from(vec![
+            Span::styled("Note: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(&app.input_buffer),
+            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::raw("  "),
+            Span::styled("[Enter]", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("park ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("[Esc]", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("cancel", Style::default().add_modifier(Modifier::DIM)),
+        ])
+    } else if app.showing_parked {
         Line::from(vec![
             Span::styled("[a-z]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("select "),
@@ -932,6 +992,8 @@ fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui:
 
         let display_num = idx + 1;
         let is_selected = app.show_selection && idx == app.selected;
+        let is_pending_park =
+            app.input_mode == InputMode::ParkNote && app.pending_park_session == Some(idx);
         let is_claude = session_info.claude_status.is_some();
 
         // CPU styling
@@ -954,8 +1016,15 @@ fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui:
             Color::Red
         };
 
-        // Prefix: ">" for selected, number for others
-        let prefix_span = if is_selected {
+        // Prefix: ">" for selected, "P" for pending park, number for others
+        let prefix_span = if is_pending_park {
+            Span::styled(
+                "P",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if is_selected {
             Span::styled(">", Style::default().add_modifier(Modifier::BOLD))
         } else if display_num <= 9 {
             Span::styled(
@@ -968,7 +1037,9 @@ fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui:
 
         if is_claude {
             // --- Claude session: 3 lines (header + status + blank) ---
-            let header_style = if is_selected {
+            let header_style = if is_pending_park {
+                Style::default().fg(Color::Yellow)
+            } else if is_selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
@@ -1045,7 +1116,9 @@ fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui:
             }
         } else {
             // --- Non-Claude session: 1 dim line ---
-            let header_style = if is_selected {
+            let header_style = if is_pending_park {
+                Style::default().fg(Color::Yellow)
+            } else if is_selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default().add_modifier(Modifier::DIM)
@@ -1083,7 +1156,7 @@ fn render_parked_view(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::
             Style::default().add_modifier(Modifier::DIM),
         )));
     } else {
-        for (i, name) in parked_list.iter().enumerate() {
+        for (i, (name, note)) in parked_list.iter().enumerate() {
             let letter = (b'a' + i as u8) as char;
             let is_selected = i == app.parked_selected;
 
@@ -1107,6 +1180,14 @@ fn render_parked_view(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::
                 Span::styled(". ", style),
                 Span::styled(name.clone(), style),
             ]));
+
+            // Show note on next line if present
+            if !note.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("   → {}", note),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                )));
+            }
         }
     }
 
@@ -1183,15 +1264,36 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
                             }
                             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                                 let idx = c.to_digit(10).unwrap() as usize - 1;
-                                app.park_session(idx);
                                 app.awaiting_park_number = false;
-                                should_refresh = true;
-                                break;
+                                app.start_park_session(idx);
+                                needs_redraw = true;
                             }
                             _ => {
                                 app.awaiting_park_number = false;
                                 needs_redraw = true;
                             }
+                        }
+                    } else if app.input_mode == InputMode::ParkNote {
+                        // Handle note input for parking
+                        match code {
+                            KeyCode::Esc => {
+                                app.cancel_park_input();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Enter => {
+                                app.complete_park_session();
+                                should_refresh = true;
+                                break;
+                            }
+                            KeyCode::Backspace => {
+                                app.input_buffer.pop();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char(c) => {
+                                app.input_buffer.push(c);
+                                needs_redraw = true;
+                            }
+                            _ => {}
                         }
                     } else {
                         // Normal mode input
