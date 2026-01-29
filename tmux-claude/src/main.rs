@@ -501,6 +501,7 @@ struct App {
     interval: u64,
     selected: usize,
     scroll_offset: usize,
+    show_selection: bool,
 }
 
 impl App {
@@ -511,6 +512,7 @@ impl App {
             interval: args.watch,
             selected: 0,
             scroll_offset: 0,
+            show_selection: false,
         }
     }
 
@@ -617,13 +619,27 @@ impl App {
         Ok(())
     }
 
+    fn hide_selection(&mut self) {
+        self.show_selection = false;
+        self.selected = 0;
+        self.scroll_offset = 0;
+    }
+
     fn move_selection_up(&mut self) {
+        if !self.show_selection {
+            self.show_selection = true;
+            return;
+        }
         if self.selected > 0 {
             self.selected -= 1;
         }
     }
 
     fn move_selection_down(&mut self) {
+        if !self.show_selection {
+            self.show_selection = true;
+            return;
+        }
         if !self.session_infos.is_empty() && self.selected < self.session_infos.len() - 1 {
             self.selected += 1;
         }
@@ -697,7 +713,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         }
 
         let display_num = idx + 1;
-        let is_selected = idx == app.selected;
+        let is_selected = app.show_selection && idx == app.selected;
         let is_claude = session_info.claude_status.is_some();
 
         // CPU styling
@@ -879,8 +895,12 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
                         }
                         // Enter: switch to selected session
                         KeyCode::Enter => {
-                            if let Some(session_info) = app.session_infos.get(app.selected) {
-                                switch_to_session(&session_info.name);
+                            if app.show_selection {
+                                if let Some(session_info) = app.session_infos.get(app.selected) {
+                                    switch_to_session(&session_info.name);
+                                }
+                                app.hide_selection();
+                                needs_redraw = true;
                             }
                         }
                         KeyCode::Char('r') | KeyCode::Char('R') => {
@@ -893,12 +913,12 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
                         KeyCode::Char('c') if cfg!(unix) => {
                             return Ok(());
                         }
-                        // Number keys (1-9): switch to session and move selection
+                        // Number keys (1-9): switch to session
                         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                             let idx = c.to_digit(10).unwrap() as usize - 1;
                             if let Some(session_info) = app.session_infos.get(idx) {
-                                app.selected = idx;
                                 switch_to_session(&session_info.name);
+                                app.hide_selection();
                                 needs_redraw = true;
                             }
                         }
@@ -922,6 +942,7 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
                                         send_key_to_pane(sess, win, pane, "1");
                                         send_key_to_pane(sess, win, pane, "Enter");
                                     }
+                                    app.hide_selection();
                                     should_refresh = true;
                                     break;
                                 }
