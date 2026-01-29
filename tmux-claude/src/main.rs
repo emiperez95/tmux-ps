@@ -1700,6 +1700,10 @@ fn run(terminal: &mut DefaultTerminal, args: Args, running: Arc<AtomicBool>) -> 
                             }
                             KeyCode::Enter => {
                                 app.unpark_selected();
+                                // Exit in popup mode if unpark succeeded
+                                if app.popup_mode && !app.showing_parked {
+                                    return Ok(());
+                                }
                                 should_refresh = true;
                                 break;
                             }
@@ -1807,9 +1811,9 @@ fn run(terminal: &mut DefaultTerminal, args: Args, running: Arc<AtomicBool>) -> 
                                 }
                                 needs_redraw = true;
                             }
-                            // Letter keys (a-z) to select todo (except a/d which are actions)
+                            // Letter keys (a-z) to select todo (except a/d/p which are actions)
                             KeyCode::Char(c)
-                                if c.is_ascii_lowercase() && c != 'a' && c != 'd' =>
+                                if c.is_ascii_lowercase() && c != 'a' && c != 'd' && c != 'p' =>
                             {
                                 let idx = (c as u8 - b'a') as usize;
                                 let count = app.detail_todos().len();
