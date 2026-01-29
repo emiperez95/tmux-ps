@@ -527,6 +527,52 @@ fn save_parked_sessions(parked: &HashMap<String, String>) {
     }
 }
 
+/// Get the path to the session todos file
+fn get_todos_file_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|p| p.join("tmux-claude").join("todos.txt"))
+}
+
+/// Load session todos from disk (name → list of todos)
+fn load_session_todos() -> HashMap<String, Vec<String>> {
+    let Some(path) = get_todos_file_path() else {
+        return HashMap::new();
+    };
+    let Ok(file) = fs::File::open(&path) else {
+        return HashMap::new();
+    };
+    let mut todos: HashMap<String, Vec<String>> = HashMap::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Format: "session-name\ttodo text"
+        if let Some((name, todo)) = line.split_once('\t') {
+            todos
+                .entry(name.to_string())
+                .or_default()
+                .push(todo.to_string());
+        }
+    }
+    todos
+}
+
+/// Save session todos to disk (tab-separated: name\ttodo, one per line)
+fn save_session_todos(todos: &HashMap<String, Vec<String>>) {
+    let Some(path) = get_todos_file_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::File::create(&path) {
+        for (name, items) in todos {
+            for item in items {
+                let _ = writeln!(file, "{}\t{}", name, item);
+            }
+        }
+    }
+}
+
 /// Check if a session name has a matching sesh config
 fn has_sesh_config(name: &str) -> bool {
     Command::new("sesh")
@@ -583,6 +629,7 @@ fn lines_for_session(session: &SessionInfo) -> usize {
 enum InputMode {
     Normal,
     ParkNote, // Entering note for parking
+    AddTodo,  // Adding a todo in detail view
 }
 
 struct App {
@@ -598,10 +645,15 @@ struct App {
     parked_selected: usize,
     error_message: Option<(String, std::time::Instant)>,
     awaiting_park_number: bool,
-    // Text input for park note
+    // Text input (park note or add todo)
     input_mode: InputMode,
     input_buffer: String,
     pending_park_session: Option<usize>, // session index to park after note entry
+    // Session todos
+    session_todos: HashMap<String, Vec<String>>, // name → list of todos
+    // Detail view
+    showing_detail: Option<usize>, // session index being viewed
+    detail_selected: usize,        // selected todo index in detail view
 }
 
 impl App {
@@ -621,6 +673,9 @@ impl App {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             pending_park_session: None,
+            session_todos: load_session_todos(),
+            showing_detail: None,
+            detail_selected: 0,
         }
     }
 
@@ -858,6 +913,98 @@ impl App {
             self.scroll_offset += 1;
         }
     }
+
+    // --- Detail view methods ---
+
+    /// Open detail view for a session by index
+    fn open_detail(&mut self, idx: usize) {
+        if idx < self.session_infos.len() {
+            self.showing_detail = Some(idx);
+            self.detail_selected = 0;
+        }
+    }
+
+    /// Close detail view
+    fn close_detail(&mut self) {
+        self.showing_detail = None;
+        self.detail_selected = 0;
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
+    /// Get the session name for the current detail view
+    fn detail_session_name(&self) -> Option<String> {
+        self.showing_detail
+            .and_then(|idx| self.session_infos.get(idx))
+            .map(|s| s.name.clone())
+    }
+
+    /// Get todos for the session in detail view
+    fn detail_todos(&self) -> Vec<String> {
+        self.detail_session_name()
+            .and_then(|name| self.session_todos.get(&name))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Start adding a todo
+    fn start_add_todo(&mut self) {
+        self.input_mode = InputMode::AddTodo;
+        self.input_buffer.clear();
+    }
+
+    /// Complete adding a todo
+    fn complete_add_todo(&mut self) {
+        if let Some(name) = self.detail_session_name() {
+            let todo = self.input_buffer.trim().to_string();
+            if !todo.is_empty() {
+                self.session_todos.entry(name).or_default().push(todo);
+                save_session_todos(&self.session_todos);
+            }
+        }
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
+    /// Cancel adding a todo
+    fn cancel_add_todo(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
+    /// Delete the selected todo
+    fn delete_selected_todo(&mut self) {
+        let Some(name) = self.detail_session_name() else {
+            return;
+        };
+
+        let should_save = if let Some(todos) = self.session_todos.get_mut(&name) {
+            if self.detail_selected < todos.len() {
+                todos.remove(self.detail_selected);
+                // Adjust selection if needed
+                if self.detail_selected >= todos.len() && self.detail_selected > 0 {
+                    self.detail_selected -= 1;
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if should_save {
+            save_session_todos(&self.session_todos);
+        }
+    }
+
+    /// Get todo count for a session name
+    fn todo_count(&self, session_name: &str) -> usize {
+        self.session_todos
+            .get(session_name)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
 }
 
 /// Build the ratatui UI
@@ -878,10 +1025,16 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
 
     // --- Header ---
     let now = chrono::Local::now();
-    let title = if app.showing_parked {
-        "tmux-claude [PARKED]"
+    let title = if app.showing_detail.is_some() {
+        if let Some(name) = app.detail_session_name() {
+            format!("tmux-claude [{}]", name)
+        } else {
+            "tmux-claude [DETAIL]".to_string()
+        }
+    } else if app.showing_parked {
+        "tmux-claude [PARKED]".to_string()
     } else {
-        "tmux-claude"
+        "tmux-claude".to_string()
     };
     let header = Line::from(vec![
         Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
@@ -898,8 +1051,10 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     ]);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
-    // --- Session list or parked list ---
-    if app.showing_parked {
+    // --- Main content: session list, parked list, or detail view ---
+    if app.showing_detail.is_some() {
+        render_detail_view(frame, app, chunks[1]);
+    } else if app.showing_parked {
         render_parked_view(frame, app, chunks[1]);
     } else {
         render_session_list(frame, app, chunks[1]);
@@ -915,7 +1070,19 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     }
 
     // --- Footer ---
-    let footer = if app.input_mode == InputMode::ParkNote {
+    let footer = if app.input_mode == InputMode::AddTodo {
+        // Todo input mode footer
+        Line::from(vec![
+            Span::styled("Todo: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(&app.input_buffer),
+            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::raw("  "),
+            Span::styled("[Enter]", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("add ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("[Esc]", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("cancel", Style::default().add_modifier(Modifier::DIM)),
+        ])
+    } else if app.input_mode == InputMode::ParkNote {
         // Note input mode footer
         Line::from(vec![
             Span::styled("Note: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -926,6 +1093,22 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
             Span::styled("park ", Style::default().add_modifier(Modifier::DIM)),
             Span::styled("[Esc]", Style::default().add_modifier(Modifier::DIM)),
             Span::styled("cancel", Style::default().add_modifier(Modifier::DIM)),
+        ])
+    } else if app.showing_detail.is_some() {
+        // Detail view footer
+        Line::from(vec![
+            Span::styled("[A]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("dd todo "),
+            Span::styled("[D]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("elete "),
+            Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("switch "),
+            Span::styled("[P]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("ark "),
+            Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("back "),
+            Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("uit"),
         ])
     } else if app.showing_parked {
         Line::from(vec![
@@ -951,6 +1134,8 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
             Span::styled("[↑↓]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("select "),
             Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("detail "),
+            Span::styled("[1-9]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("switch "),
             Span::styled("[P+#]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("ark "),
@@ -1045,7 +1230,7 @@ fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui:
                 Style::default()
             };
 
-            lines.push(Line::from(vec![
+            let mut header_spans = vec![
                 prefix_span,
                 Span::styled(".", header_style),
                 Span::styled(" ", header_style),
@@ -1058,7 +1243,18 @@ fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui:
                 Span::styled("/", header_style),
                 Span::styled(mem_text, header_style.fg(mem_color)),
                 Span::styled("]", header_style),
-            ]));
+            ];
+
+            // Add todo count indicator if there are todos
+            let todo_count = app.todo_count(&session_info.name);
+            if todo_count > 0 {
+                header_spans.push(Span::styled(
+                    format!(" [{}]", todo_count),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+
+            lines.push(Line::from(header_spans));
 
             // Status line
             if let Some(ref status) = session_info.claude_status {
@@ -1124,7 +1320,7 @@ fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui:
                 Style::default().add_modifier(Modifier::DIM)
             };
 
-            lines.push(Line::from(vec![
+            let mut header_spans = vec![
                 prefix_span,
                 Span::styled(".", header_style),
                 Span::styled(" ", header_style),
@@ -1134,7 +1330,18 @@ fn render_session_list(frame: &mut ratatui::Frame, app: &mut App, area: ratatui:
                 Span::styled("/", header_style),
                 Span::styled(mem_text, header_style.fg(mem_color)),
                 Span::styled("]", header_style),
-            ]));
+            ];
+
+            // Add todo count indicator if there are todos
+            let todo_count = app.todo_count(&session_info.name);
+            if todo_count > 0 {
+                header_spans.push(Span::styled(
+                    format!(" [{}]", todo_count),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+
+            lines.push(Line::from(header_spans));
         }
 
         lines_remaining -= needed;
@@ -1188,6 +1395,115 @@ fn render_parked_view(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
                 )));
             }
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Render the session detail view
+fn render_detail_view(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::raw("")); // Spacing after header
+
+    let Some(idx) = app.showing_detail else {
+        return;
+    };
+    let Some(session_info) = app.session_infos.get(idx) else {
+        return;
+    };
+
+    // --- Session stats ---
+    let cpu_text = format!("{:.1}%", session_info.total_cpu);
+    let cpu_color = if session_info.total_cpu < 20.0 {
+        Color::Green
+    } else if session_info.total_cpu < 100.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+
+    let mem_text = format_memory(session_info.total_mem_kb);
+    let mem_color = if session_info.total_mem_kb < 512000 {
+        Color::Green
+    } else if session_info.total_mem_kb < 2048000 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("CPU: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(cpu_text, Style::default().fg(cpu_color)),
+        Span::raw("  "),
+        Span::styled("MEM: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(mem_text, Style::default().fg(mem_color)),
+    ]));
+
+    // --- Claude status ---
+    if let Some(ref status) = session_info.claude_status {
+        let (status_text, status_color) = match status {
+            ClaudeStatus::Waiting => ("waiting for input".to_string(), Color::Cyan),
+            ClaudeStatus::Thinking(action) => (action.clone(), Color::White),
+            ClaudeStatus::RunningTool(tool) => (format!("running {}", tool), Color::White),
+            ClaudeStatus::NeedsPermission(cmd, _) => {
+                (format!("needs permission: {}", cmd), Color::Yellow)
+            }
+            ClaudeStatus::PlanReview => ("plan ready for review".to_string(), Color::Magenta),
+            ClaudeStatus::QuestionAsked => ("question asked".to_string(), Color::Magenta),
+            ClaudeStatus::Unknown => ("active".to_string(), Color::White),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Claude: ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(status_text, Style::default().fg(status_color)),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Claude: not running",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+
+    lines.push(Line::raw("")); // Spacing
+
+    // --- Todos section ---
+    lines.push(Line::from(Span::styled(
+        "Todos:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+
+    let todos = app.detail_todos();
+    if todos.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no todos)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    } else {
+        for (i, todo) in todos.iter().enumerate() {
+            let letter = (b'a' + i as u8) as char;
+            let is_selected = i == app.detail_selected;
+
+            let prefix = if is_selected {
+                Span::styled(">", Style::default().add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(
+                    format!("{}", letter),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )
+            };
+
+            let style = if is_selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                prefix,
+                Span::styled(". ", style),
+                Span::styled(todo.clone(), style),
+            ]));
         }
     }
 
@@ -1295,6 +1611,87 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
                             }
                             _ => {}
                         }
+                    } else if app.input_mode == InputMode::AddTodo {
+                        // Handle todo input
+                        match code {
+                            KeyCode::Esc => {
+                                app.cancel_add_todo();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Enter => {
+                                app.complete_add_todo();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Backspace => {
+                                app.input_buffer.pop();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char(c) => {
+                                app.input_buffer.push(c);
+                                needs_redraw = true;
+                            }
+                            _ => {}
+                        }
+                    } else if app.showing_detail.is_some() {
+                        // Handle detail view input
+                        match code {
+                            KeyCode::Esc => {
+                                app.close_detail();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                return Ok(());
+                            }
+                            KeyCode::Char('a') | KeyCode::Char('A') => {
+                                app.start_add_todo();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Backspace => {
+                                app.delete_selected_todo();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if app.detail_selected > 0 {
+                                    app.detail_selected -= 1;
+                                }
+                                needs_redraw = true;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let count = app.detail_todos().len();
+                                if count > 0 && app.detail_selected < count - 1 {
+                                    app.detail_selected += 1;
+                                }
+                                needs_redraw = true;
+                            }
+                            // Letter keys (a-z) to select todo (except a/d which are actions)
+                            KeyCode::Char(c)
+                                if c.is_ascii_lowercase() && c != 'a' && c != 'd' =>
+                            {
+                                let idx = (c as u8 - b'a') as usize;
+                                let count = app.detail_todos().len();
+                                if idx < count {
+                                    app.detail_selected = idx;
+                                    needs_redraw = true;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                // Switch to this session
+                                if let Some(name) = app.detail_session_name() {
+                                    switch_to_session(&name);
+                                    app.close_detail();
+                                    needs_redraw = true;
+                                }
+                            }
+                            KeyCode::Char('p') | KeyCode::Char('P') => {
+                                // Park this session
+                                if let Some(idx) = app.showing_detail {
+                                    app.close_detail();
+                                    app.start_park_session(idx);
+                                    needs_redraw = true;
+                                }
+                            }
+                            _ => {}
+                        }
                     } else {
                         // Normal mode input
                         match code {
@@ -1307,14 +1704,10 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
                                 app.move_selection_down();
                                 needs_redraw = true;
                             }
-                            // Enter: switch to selected session
+                            // Enter: open detail view for selected session
                             KeyCode::Enter => {
                                 if app.show_selection {
-                                    if let Some(session_info) = app.session_infos.get(app.selected)
-                                    {
-                                        switch_to_session(&session_info.name);
-                                    }
-                                    app.hide_selection();
+                                    app.open_detail(app.selected);
                                     needs_redraw = true;
                                 }
                             }
