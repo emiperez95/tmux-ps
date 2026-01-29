@@ -481,6 +481,16 @@ fn find_session_by_permission_key(sessions: &[SessionInfo], key: char) -> Option
         .find(|s| s.permission_key == Some(key.to_ascii_lowercase()))
 }
 
+/// Returns the number of display lines a session occupies:
+/// Claude sessions get 3 lines (header + status + blank), non-Claude get 1 line.
+fn lines_for_session(session: &SessionInfo) -> usize {
+    if session.claude_status.is_some() {
+        3
+    } else {
+        1
+    }
+}
+
 // ---------------------------------------------------------------------------
 // App state & ratatui rendering
 // ---------------------------------------------------------------------------
@@ -489,6 +499,8 @@ struct App {
     session_infos: Vec<SessionInfo>,
     filter: Option<String>,
     interval: u64,
+    selected: usize,
+    scroll_offset: usize,
 }
 
 impl App {
@@ -497,6 +509,8 @@ impl App {
             session_infos: Vec::new(),
             filter: args.filter.clone(),
             interval: args.watch,
+            selected: 0,
+            scroll_offset: 0,
         }
     }
 
@@ -586,13 +600,59 @@ impl App {
             });
         }
 
+        // Sort: Claude sessions first, then non-Claude (stable preserves order within groups)
+        session_infos.sort_by_key(|s| s.claude_status.is_none());
+
         self.session_infos = session_infos;
+
+        // Clamp selection if list shrank
+        if !self.session_infos.is_empty() {
+            if self.selected >= self.session_infos.len() {
+                self.selected = self.session_infos.len() - 1;
+            }
+        } else {
+            self.selected = 0;
+        }
+
         Ok(())
+    }
+
+    fn move_selection_up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    fn move_selection_down(&mut self) {
+        if !self.session_infos.is_empty() && self.selected < self.session_infos.len() - 1 {
+            self.selected += 1;
+        }
+    }
+
+    fn ensure_visible(&mut self, available_height: usize) {
+        if available_height == 0 || self.session_infos.is_empty() {
+            return;
+        }
+        // Scroll up if selected is above viewport
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        }
+        // Scroll down if selected is below viewport — accumulate lines from scroll_offset
+        loop {
+            let mut used = 0;
+            for i in self.scroll_offset..=self.selected {
+                used += lines_for_session(&self.session_infos[i]);
+            }
+            if used <= available_height {
+                break;
+            }
+            self.scroll_offset += 1;
+        }
     }
 }
 
 /// Build the ratatui UI
-fn ui(frame: &mut ratatui::Frame, app: &App) {
+fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
 
     let chunks = Layout::vertical([
@@ -620,10 +680,25 @@ fn ui(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
     // --- Session list ---
-    let mut lines: Vec<Line> = Vec::new();
+    let available_height = chunks[1].height as usize;
 
-    for (idx, session_info) in app.session_infos.iter().enumerate() {
+    // Adjust scroll_offset so the selected session is visible
+    app.ensure_visible(available_height);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut lines_remaining = available_height;
+    let mut idx = app.scroll_offset;
+
+    while idx < app.session_infos.len() {
+        let session_info = &app.session_infos[idx];
+        let needed = lines_for_session(session_info);
+        if lines_remaining < needed {
+            break;
+        }
+
         let display_num = idx + 1;
+        let is_selected = idx == app.selected;
+        let is_claude = session_info.claude_status.is_some();
 
         // CPU styling
         let cpu_text = format!("{:.1}%", session_info.total_cpu);
@@ -645,85 +720,128 @@ fn ui(frame: &mut ratatui::Frame, app: &App) {
             Color::Red
         };
 
-        // Number prefix
-        let num_span = if display_num <= 9 {
+        // Prefix: ">" for selected, number for others
+        let prefix_span = if is_selected {
             Span::styled(
-                format!("{}.", display_num),
+                ">",
+                Style::default().add_modifier(Modifier::BOLD),
+            )
+        } else if display_num <= 9 {
+            Span::styled(
+                format!("{}", display_num),
                 Style::default().add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::raw("  ")
+            Span::raw(" ")
         };
 
-        // Session header line
-        lines.push(Line::from(vec![
-            num_span,
-            Span::raw(" "),
-            Span::styled(
-                &session_info.name,
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" ["),
-            Span::styled(cpu_text, Style::default().fg(cpu_color)),
-            Span::raw("/"),
-            Span::styled(mem_text, Style::default().fg(mem_color)),
-            Span::raw("]"),
-        ]));
-
-        // Status line (always reserve 2 lines for spacing)
-        if let Some(ref status) = session_info.claude_status {
-            let status_line = match status {
-                ClaudeStatus::NeedsPermission(cmd, desc) => {
-                    let text = if let Some(key) = session_info.permission_key {
-                        format!(
-                            "   → [{}/{}] needs permission: {}",
-                            key,
-                            key.to_ascii_uppercase(),
-                            cmd
-                        )
-                    } else {
-                        format!("   → needs permission: {}", cmd)
-                    };
-                    lines.push(Line::from(Span::styled(
-                        text,
-                        Style::default().fg(Color::Yellow),
-                    )));
-                    let desc_text = desc.as_deref().unwrap_or("");
-                    lines.push(Line::from(Span::styled(
-                        format!("     {}", desc_text),
-                        Style::default().add_modifier(Modifier::DIM),
-                    )));
-                    continue;
-                }
-                ClaudeStatus::PlanReview => Line::from(Span::styled(
-                    format!("   → {}", status),
-                    Style::default().fg(Color::Magenta),
-                )),
-                ClaudeStatus::Waiting => Line::from(Span::styled(
-                    format!("   → {}", status),
-                    Style::default().fg(Color::Cyan),
-                )),
-                _ => Line::from(Span::styled(
-                    format!("   → {}", status),
-                    Style::default().add_modifier(Modifier::DIM),
-                )),
+        if is_claude {
+            // --- Claude session: 3 lines (header + status + blank) ---
+            let header_style = if is_selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
             };
-            lines.push(status_line);
-            lines.push(Line::raw(""));
+
+            lines.push(Line::from(vec![
+                prefix_span,
+                Span::styled(".", header_style),
+                Span::styled(" ", header_style),
+                Span::styled(
+                    session_info.name.clone(),
+                    header_style.add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" [", header_style),
+                Span::styled(cpu_text, header_style.fg(cpu_color)),
+                Span::styled("/", header_style),
+                Span::styled(mem_text, header_style.fg(mem_color)),
+                Span::styled("]", header_style),
+            ]));
+
+            // Status line
+            if let Some(ref status) = session_info.claude_status {
+                match status {
+                    ClaudeStatus::NeedsPermission(cmd, desc) => {
+                        let text = if let Some(key) = session_info.permission_key {
+                            format!(
+                                "   → [{}/{}] needs permission: {}",
+                                key,
+                                key.to_ascii_uppercase(),
+                                cmd
+                            )
+                        } else {
+                            format!("   → needs permission: {}", cmd)
+                        };
+                        lines.push(Line::from(Span::styled(
+                            text,
+                            Style::default().fg(Color::Yellow),
+                        )));
+                        let desc_text = desc.as_deref().unwrap_or("");
+                        lines.push(Line::from(Span::styled(
+                            format!("     {}", desc_text),
+                            Style::default().add_modifier(Modifier::DIM),
+                        )));
+                    }
+                    ClaudeStatus::PlanReview => {
+                        lines.push(Line::from(Span::styled(
+                            format!("   → {}", status),
+                            Style::default().fg(Color::Magenta),
+                        )));
+                        lines.push(Line::raw(""));
+                    }
+                    ClaudeStatus::Waiting => {
+                        lines.push(Line::from(Span::styled(
+                            format!("   → {}", status),
+                            Style::default().fg(Color::Cyan),
+                        )));
+                        lines.push(Line::raw(""));
+                    }
+                    _ => {
+                        lines.push(Line::from(Span::styled(
+                            format!("   → {}", status),
+                            Style::default().add_modifier(Modifier::DIM),
+                        )));
+                        lines.push(Line::raw(""));
+                    }
+                }
+            }
         } else {
-            lines.push(Line::raw(""));
-            lines.push(Line::raw(""));
+            // --- Non-Claude session: 1 dim line ---
+            let header_style = if is_selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+
+            lines.push(Line::from(vec![
+                prefix_span,
+                Span::styled(".", header_style),
+                Span::styled(" ", header_style),
+                Span::styled(session_info.name.clone(), header_style),
+                Span::styled(" [", header_style),
+                Span::styled(cpu_text, header_style.fg(cpu_color)),
+                Span::styled("/", header_style),
+                Span::styled(mem_text, header_style.fg(mem_color)),
+                Span::styled("]", header_style),
+            ]));
         }
+
+        lines_remaining -= needed;
+        idx += 1;
     }
 
     frame.render_widget(Paragraph::new(lines), chunks[1]);
 
     // --- Footer ---
     let footer = Line::from(vec![
+        Span::styled("[↑↓]", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("select "),
+        Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("switch "),
         Span::styled("[R]", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("efresh "),
         Span::styled("[1-9]", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("switch "),
+        Span::raw("jump "),
         Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("uit"),
     ]);
@@ -738,17 +856,33 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
         app.refresh()?;
 
         // 2. Draw UI
-        terminal.draw(|frame| ui(frame, &app))?;
+        terminal.draw(|frame| ui(frame, &mut app))?;
 
         // 3. Poll for input (100ms intervals up to refresh interval)
         let sleep_ms = 100u64;
         let iterations = (app.interval * 1000) / sleep_ms;
         let mut should_refresh = false;
+        let mut needs_redraw = false;
 
         for _ in 0..iterations {
             if poll(Duration::from_millis(sleep_ms))? {
                 if let Event::Key(KeyEvent { code, .. }) = read()? {
                     match code {
+                        // Navigation
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.move_selection_up();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.move_selection_down();
+                            needs_redraw = true;
+                        }
+                        // Enter: switch to selected session
+                        KeyCode::Enter => {
+                            if let Some(session_info) = app.session_infos.get(app.selected) {
+                                switch_to_session(&session_info.name);
+                            }
+                        }
                         KeyCode::Char('r') | KeyCode::Char('R') => {
                             should_refresh = true;
                             break;
@@ -759,11 +893,13 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
                         KeyCode::Char('c') if cfg!(unix) => {
                             return Ok(());
                         }
-                        // Number keys (1-9): switch to session
+                        // Number keys (1-9): switch to session and move selection
                         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                             let idx = c.to_digit(10).unwrap() as usize - 1;
                             if let Some(session_info) = app.session_infos.get(idx) {
+                                app.selected = idx;
                                 switch_to_session(&session_info.name);
+                                needs_redraw = true;
                             }
                         }
                         // Letter keys for permission approval
@@ -792,6 +928,12 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
                             }
                         }
                         _ => {}
+                    }
+
+                    // Redraw immediately after navigation keys
+                    if needs_redraw {
+                        terminal.draw(|frame| ui(frame, &mut app))?;
+                        needs_redraw = false;
                     }
                 }
             }
