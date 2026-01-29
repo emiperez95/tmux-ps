@@ -13,7 +13,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
 #[derive(Parser, Debug)]
@@ -586,6 +588,68 @@ fn save_session_todos(todos: &HashMap<String, Vec<String>>) {
     }
 }
 
+/// Get the path to the restore file for session persistence across restarts
+fn get_restore_file_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|p| p.join("tmux-claude").join("restore.txt"))
+}
+
+/// Load restorable session names from disk
+fn load_restorable_sessions() -> Vec<String> {
+    let Some(path) = get_restore_file_path() else {
+        return Vec::new();
+    };
+    let Ok(file) = fs::File::open(&path) else {
+        return Vec::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .collect()
+}
+
+/// Save restorable session names to disk (only sessions with sesh config)
+fn save_restorable_sessions(session_names: &[String]) {
+    let Some(path) = get_restore_file_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::File::create(&path) {
+        for name in session_names {
+            let _ = writeln!(file, "{}", name);
+        }
+    }
+}
+
+/// Get list of currently running tmux session names
+fn get_current_tmux_session_names() -> Vec<String> {
+    Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Get the current active tmux session name
+fn get_current_tmux_session() -> Option<String> {
+    Command::new("tmux")
+        .args(["display-message", "-p", "#{session_name}"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let name = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if name.is_empty() { None } else { Some(name) }
+        })
+}
+
 /// Check if a session name has a matching sesh config
 fn has_sesh_config(name: &str) -> bool {
     Command::new("sesh")
@@ -656,7 +720,7 @@ struct App {
     parked_sessions: HashMap<String, String>, // name → note
     showing_parked: bool,
     parked_selected: usize,
-    error_message: Option<(String, std::time::Instant)>,
+    error_message: Option<(String, Instant)>,
     awaiting_park_number: bool,
     // Text input (park note or add todo)
     input_mode: InputMode,
@@ -667,6 +731,8 @@ struct App {
     // Detail view
     showing_detail: Option<usize>, // session index being viewed
     detail_selected: usize,        // selected todo index in detail view
+    // Session restore
+    last_save: Instant, // Track last save time for periodic saves
 }
 
 impl App {
@@ -689,6 +755,7 @@ impl App {
             session_todos: load_session_todos(),
             showing_detail: None,
             detail_selected: 0,
+            last_save: Instant::now(),
         }
     }
 
@@ -1019,6 +1086,25 @@ impl App {
             .get(session_name)
             .map(|v| v.len())
             .unwrap_or(0)
+    }
+
+    /// Save restorable sessions (sessions with sesh config)
+    fn save_restorable(&self) {
+        let restorable: Vec<String> = self
+            .session_infos
+            .iter()
+            .filter(|s| has_sesh_config(&s.name))
+            .map(|s| s.name.clone())
+            .collect();
+        save_restorable_sessions(&restorable);
+    }
+
+    /// Check if it's time for periodic save (every 10 minutes)
+    fn maybe_periodic_save(&mut self) {
+        if self.last_save.elapsed() > Duration::from_secs(600) {
+            self.save_restorable();
+            self.last_save = Instant::now();
+        }
     }
 }
 
@@ -1545,13 +1631,21 @@ fn render_detail_view(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
+fn run(terminal: &mut DefaultTerminal, args: Args, running: Arc<AtomicBool>) -> Result<()> {
     let mut app = App::new(&args);
 
     loop {
+        // Check for signal-based exit
+        if !running.load(Ordering::SeqCst) {
+            app.save_restorable();
+            return Ok(());
+        }
+
         // 1. Gather data (only when not showing parked view)
         if !app.showing_parked {
             app.refresh()?;
+            // Periodic save check (every 10 minutes)
+            app.maybe_periodic_save();
         }
 
         // 2. Draw UI
@@ -1564,6 +1658,12 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
         let mut needs_redraw = false;
 
         for _ in 0..iterations {
+            // Check for signal-based exit during poll loop
+            if !running.load(Ordering::SeqCst) {
+                app.save_restorable();
+                return Ok(());
+            }
+
             if poll(Duration::from_millis(sleep_ms))? {
                 if let Event::Key(KeyEvent { code, .. }) = read()? {
                     // Handle parked view input
@@ -1575,6 +1675,7 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
                                 needs_redraw = true;
                             }
                             KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                app.save_restorable();
                                 return Ok(());
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
@@ -1675,6 +1776,7 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
                                 needs_redraw = true;
                             }
                             KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                app.save_restorable();
                                 return Ok(());
                             }
                             KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -1762,9 +1864,11 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
                                 break;
                             }
                             KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                app.save_restorable();
                                 return Ok(());
                             }
                             KeyCode::Char('c') if cfg!(unix) => {
+                                app.save_restorable();
                                 return Ok(());
                             }
                             // Number keys (1-9): switch to session
@@ -1823,8 +1927,62 @@ fn run(terminal: &mut DefaultTerminal, args: Args) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Check for sessions to restore BEFORE starting TUI
+    let saved = load_restorable_sessions();
+    let current = get_current_tmux_session_names();
+    let to_restore: Vec<_> = saved
+        .into_iter()
+        .filter(|name| !current.contains(name))
+        .collect();
+
+    if !to_restore.is_empty() {
+        println!("Found {} session(s) to restore:", to_restore.len());
+        for name in &to_restore {
+            println!("  - {}", name);
+        }
+        print!("Restore all? [Y/n] ");
+        std::io::stdout().flush().ok();
+
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            let input = input.trim().to_lowercase();
+            if input.is_empty() || input == "y" || input == "yes" {
+                // Remember current session to switch back after restore
+                let original_session = get_current_tmux_session();
+
+                println!("Restoring sessions...");
+                for name in &to_restore {
+                    if sesh_connect(name) {
+                        println!("  ✓ {}", name);
+                    } else {
+                        println!("  ✗ {} (failed)", name);
+                    }
+                }
+
+                // Switch back to original session
+                if let Some(ref original) = original_session {
+                    switch_to_session(original);
+                }
+
+                // Brief pause to let sessions stabilize
+                std::thread::sleep(Duration::from_millis(500));
+            } else {
+                println!("Skipping restore.");
+            }
+        }
+    }
+
+    // Set up signal handler for graceful shutdown
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })
+    .expect("Error setting Ctrl-C handler");
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, args);
+    let result = run(&mut terminal, args, running);
     ratatui::restore();
     result
 }
