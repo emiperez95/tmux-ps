@@ -10,7 +10,7 @@ use ratatui::{
     DefaultTerminal,
 };
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -755,6 +755,8 @@ struct App {
     detail_selected: usize,        // selected todo index in detail view
     // Session restore
     last_save: Instant, // Track last save time for periodic saves
+    // Stable permission key assignments (session name → key)
+    permission_key_map: HashMap<String, char>,
 }
 
 impl App {
@@ -779,6 +781,7 @@ impl App {
             showing_detail: None,
             detail_selected: 0,
             last_save: Instant::now(),
+            permission_key_map: HashMap::new(),
         }
     }
 
@@ -789,7 +792,6 @@ impl App {
 
         let sessions = get_tmux_sessions()?;
         let mut session_infos = Vec::new();
-        let mut permission_key_idx = 0;
 
         for session in sessions {
             if !matches_filter(&session.name, &self.filter) {
@@ -847,27 +849,11 @@ impl App {
                 }
             }
 
-            // Assign permission key if this session needs permission or edit approval
-            let permission_key = if matches!(
-                claude_status,
-                Some(ClaudeStatus::NeedsPermission(_, _)) | Some(ClaudeStatus::EditApproval(_))
-            ) {
-                if permission_key_idx < PERMISSION_KEYS.len() {
-                    let key = PERMISSION_KEYS[permission_key_idx];
-                    permission_key_idx += 1;
-                    Some(key)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
             session_infos.push(SessionInfo {
                 name: session.name.clone(),
                 claude_status,
                 claude_pane,
-                permission_key,
+                permission_key: None, // Will be assigned after sorting
                 total_cpu,
                 total_mem_kb,
                 last_activity,
@@ -876,6 +862,47 @@ impl App {
 
         // Sort: Claude sessions first, then non-Claude (stable preserves order within groups)
         session_infos.sort_by_key(|s| s.claude_status.is_none());
+
+        // Stable permission key assignment
+        // 1. Determine which sessions need permission
+        let sessions_needing_permission: HashSet<String> = session_infos
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.claude_status,
+                    Some(ClaudeStatus::NeedsPermission(_, _)) | Some(ClaudeStatus::EditApproval(_))
+                )
+            })
+            .map(|s| s.name.clone())
+            .collect();
+
+        // 2. Remove sessions that no longer need permission from the map
+        self.permission_key_map
+            .retain(|name, _| sessions_needing_permission.contains(name));
+
+        // 3. Get currently used keys and find available keys
+        let used_keys: HashSet<char> = self.permission_key_map.values().copied().collect();
+        let mut available_keys: Vec<char> = PERMISSION_KEYS
+            .iter()
+            .filter(|k| !used_keys.contains(k))
+            .copied()
+            .collect();
+
+        // 4. Assign keys to sessions that need permission
+        for session in &mut session_infos {
+            if sessions_needing_permission.contains(&session.name) {
+                if let Some(&existing_key) = self.permission_key_map.get(&session.name) {
+                    // Already has a key, use it
+                    session.permission_key = Some(existing_key);
+                } else if let Some(new_key) = available_keys.pop() {
+                    // Assign first available key
+                    self.permission_key_map
+                        .insert(session.name.clone(), new_key);
+                    session.permission_key = Some(new_key);
+                }
+                // else: no more keys available, permission_key stays None
+            }
+        }
 
         self.session_infos = session_infos;
 
