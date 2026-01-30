@@ -78,17 +78,33 @@ tmux-ps/                  (repo root)
 └── .gitignore
 ```
 
+## Testing
+
+tmux-claude has 31 unit tests covering:
+- String utilities (truncate, extract filename, format memory)
+- Path utilities (cwd encoding, filter matching)
+- Process detection (Claude vs non-Claude processes)
+- JSONL parsing (all status types: Waiting, NeedsPermission, EditApproval, PlanReview, QuestionAsked)
+
+```bash
+cd tmux-claude && cargo test
+```
+
 ## Performance
 
 tmux-claude includes a benchmark tool to measure refresh cycle performance:
 
 ```bash
+# Live benchmark (depends on current tmux state)
 cd tmux-claude && cargo run --release --bin bench
+
+# Mock benchmark (reproducible, no tmux dependency)
+cargo run --release --bin bench -- --mock --sessions 6 --iterations 50
 ```
 
-Typical breakdown (~50ms total with 6 sessions):
+Typical breakdown (~60ms total with 6 sessions):
 - **tmux discovery** (~82%): list-sessions → list-windows → list-panes chain
-- **sysinfo** (~12%): System process info for CPU/RAM metrics
+- **sysinfo** (~11%): System process info for CPU/RAM metrics
 - **jsonl reading** (~6%): Claude status from project jsonl files
 
 ## Installation

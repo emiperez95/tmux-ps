@@ -189,25 +189,9 @@ fn read_last_lines(path: &PathBuf, n: usize) -> Vec<String> {
     lines.into_iter().rev().take(n).collect()
 }
 
-/// Parse Claude status from jsonl file
-fn get_claude_status_from_jsonl(cwd: &str) -> Option<JsonlStatus> {
-    let projects_path = cwd_to_claude_projects_path(cwd);
-    let jsonl_path = find_latest_jsonl(&projects_path)?;
-
-    let last_lines = read_last_lines(&jsonl_path, 10);
-    if last_lines.is_empty() {
-        return None;
-    }
-
-    // Parse entries (they're in reverse order)
-    let mut entries: Vec<JsonlEntry> = last_lines
-        .iter()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-
-    // Reverse to get chronological order
-    entries.reverse();
-
+/// Parse Claude status from a list of jsonl entries (pure function, testable)
+/// Entries should be in chronological order (oldest first)
+fn parse_status_from_entries(entries: &[JsonlEntry]) -> (ClaudeStatus, Option<DateTime<Utc>>) {
     // Find the last timestamp
     let timestamp = entries
         .iter()
@@ -250,14 +234,19 @@ fn get_claude_status_from_jsonl(cwd: &str) -> Option<JsonlStatus> {
                         .input
                         .as_ref()
                         .map(|input| {
-                            let command = input.get("command")
+                            let command = input
+                                .get("command")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown command")
                                 .to_string();
-                            let description = input.get("description")
+                            let description = input
+                                .get("description")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string());
-                            (format!("Bash: {}", truncate_command(&command, 60)), description)
+                            (
+                                format!("Bash: {}", truncate_command(&command, 60)),
+                                description,
+                            )
                         })
                         .unwrap_or(("Bash: unknown".to_string(), None));
                     ClaudeStatus::NeedsPermission(cmd, desc)
@@ -283,6 +272,30 @@ fn get_claude_status_from_jsonl(cwd: &str) -> Option<JsonlStatus> {
         // No clear signal, assume working
         _ => ClaudeStatus::Unknown,
     };
+
+    (status, timestamp)
+}
+
+/// Parse Claude status from jsonl file
+fn get_claude_status_from_jsonl(cwd: &str) -> Option<JsonlStatus> {
+    let projects_path = cwd_to_claude_projects_path(cwd);
+    let jsonl_path = find_latest_jsonl(&projects_path)?;
+
+    let last_lines = read_last_lines(&jsonl_path, 10);
+    if last_lines.is_empty() {
+        return None;
+    }
+
+    // Parse entries (they're in reverse order from read_last_lines)
+    let mut entries: Vec<JsonlEntry> = last_lines
+        .iter()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+
+    // Reverse to get chronological order
+    entries.reverse();
+
+    let (status, timestamp) = parse_status_from_entries(&entries);
 
     Some(JsonlStatus { status, timestamp })
 }
@@ -324,8 +337,13 @@ fn is_claude_process(proc: &ProcessInfo) -> bool {
     let name_lower = proc.name.to_lowercase();
     let cmd_lower = proc.command.to_lowercase();
 
+    // Exclude tmux-claude itself
+    if cmd_lower.contains("tmux-claude") || name_lower.contains("tmux-claude") {
+        return false;
+    }
+
     // Check for claude in command
-    if cmd_lower.contains("claude") && !cmd_lower.contains("tmux-claude") {
+    if cmd_lower.contains("claude") {
         return true;
     }
 
@@ -2012,4 +2030,283 @@ fn main() -> Result<()> {
     let result = run(&mut terminal, args, running);
     ratatui::restore();
     result
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod string_utils {
+        use super::*;
+
+        #[test]
+        fn test_truncate_command_short() {
+            assert_eq!(truncate_command("short", 10), "short");
+        }
+
+        #[test]
+        fn test_truncate_command_exact() {
+            assert_eq!(truncate_command("exactly 10", 10), "exactly 10");
+        }
+
+        #[test]
+        fn test_truncate_command_long() {
+            assert_eq!(truncate_command("this is too long", 10), "this is...");
+        }
+
+        #[test]
+        fn test_truncate_command_empty() {
+            assert_eq!(truncate_command("", 10), "");
+        }
+
+        #[test]
+        fn test_extract_filename_full_path() {
+            assert_eq!(extract_filename("/path/to/file.txt"), "file.txt");
+        }
+
+        #[test]
+        fn test_extract_filename_just_name() {
+            assert_eq!(extract_filename("file.txt"), "file.txt");
+        }
+
+        #[test]
+        fn test_extract_filename_absolute() {
+            assert_eq!(extract_filename("/absolute"), "absolute");
+        }
+
+        #[test]
+        fn test_format_memory_kb() {
+            assert_eq!(format_memory(512), "512K");
+        }
+
+        #[test]
+        fn test_format_memory_mb() {
+            assert_eq!(format_memory(1024), "1M");
+            assert_eq!(format_memory(2048), "2M");
+        }
+
+        #[test]
+        fn test_format_memory_gb() {
+            assert_eq!(format_memory(1048576), "1.0G");
+            assert_eq!(format_memory(2097152), "2.0G");
+        }
+    }
+
+    mod path_utils {
+        use super::*;
+
+        #[test]
+        fn test_cwd_to_claude_projects_path() {
+            let path = cwd_to_claude_projects_path("/Users/test/project");
+            let path_str = path.to_string_lossy();
+            assert!(path_str.ends_with("-Users-test-project"));
+            assert!(path_str.contains(".claude/projects"));
+        }
+
+        #[test]
+        fn test_matches_filter_none() {
+            assert!(matches_filter("my-session", &None));
+        }
+
+        #[test]
+        fn test_matches_filter_match() {
+            assert!(matches_filter("my-session", &Some("my".to_string())));
+        }
+
+        #[test]
+        fn test_matches_filter_case_insensitive() {
+            assert!(matches_filter("MY-SESSION", &Some("my".to_string())));
+            assert!(matches_filter("my-session", &Some("MY".to_string())));
+        }
+
+        #[test]
+        fn test_matches_filter_no_match() {
+            assert!(!matches_filter("other", &Some("my".to_string())));
+        }
+    }
+
+    mod process_detection {
+        use super::*;
+
+        fn make_proc(name: &str, command: &str) -> ProcessInfo {
+            ProcessInfo {
+                pid: 1,
+                name: name.to_string(),
+                cpu_percent: 0.0,
+                memory_kb: 0,
+                command: command.to_string(),
+            }
+        }
+
+        #[test]
+        fn test_is_claude_version_pattern() {
+            assert!(is_claude_process(&make_proc("2.1.20", "")));
+            assert!(is_claude_process(&make_proc("2.1.23", "")));
+            assert!(is_claude_process(&make_proc("3.0.0", "")));
+        }
+
+        #[test]
+        fn test_is_claude_command_contains() {
+            assert!(is_claude_process(&make_proc("node", "/path/to/claude")));
+            assert!(is_claude_process(&make_proc("node", "claude -c")));
+        }
+
+        #[test]
+        fn test_is_not_claude_regular_process() {
+            assert!(!is_claude_process(&make_proc("bash", "ls")));
+            assert!(!is_claude_process(&make_proc("vim", "vim file.txt")));
+        }
+
+        #[test]
+        fn test_is_not_claude_tmux_claude() {
+            // tmux-claude itself should not match
+            assert!(!is_claude_process(&make_proc("tmux-claude", "")));
+            assert!(!is_claude_process(&make_proc("node", "tmux-claude")));
+        }
+    }
+
+    mod jsonl_parsing {
+        use super::*;
+
+        fn parse_entry(json: &str) -> JsonlEntry {
+            serde_json::from_str(json).expect("Failed to parse test JSON")
+        }
+
+        #[test]
+        fn test_waiting_status_stop_hook() {
+            let progress = r#"{"type":"progress","data":{"hookEvent":"Stop"},"timestamp":"2026-01-29T10:00:00Z"}"#;
+            let entries = vec![parse_entry(progress)];
+            let (status, _) = parse_status_from_entries(&entries);
+            assert!(matches!(status, ClaudeStatus::Waiting));
+        }
+
+        #[test]
+        fn test_needs_permission_bash() {
+            let assistant = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"pnpm exec prettier --write file.json","description":"Format JSON files"}}]}}"#;
+            let progress = r#"{"type":"progress","data":{"hookEvent":"PreToolUse"}}"#;
+            let entries = vec![parse_entry(assistant), parse_entry(progress)];
+            let (status, _) = parse_status_from_entries(&entries);
+            match status {
+                ClaudeStatus::NeedsPermission(cmd, desc) => {
+                    assert!(cmd.contains("Bash:"));
+                    assert!(cmd.contains("prettier"));
+                    assert_eq!(desc, Some("Format JSON files".to_string()));
+                }
+                _ => panic!("Expected NeedsPermission, got {:?}", status),
+            }
+        }
+
+        #[test]
+        fn test_edit_approval_write() {
+            let assistant = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"/Users/test/project/test_file.txt","content":"test"}}]}}"#;
+            let progress = r#"{"type":"progress","data":{"hookEvent":"PreToolUse"}}"#;
+            let entries = vec![parse_entry(assistant), parse_entry(progress)];
+            let (status, _) = parse_status_from_entries(&entries);
+            match status {
+                ClaudeStatus::EditApproval(file) => {
+                    assert_eq!(file, "test_file.txt");
+                }
+                _ => panic!("Expected EditApproval, got {:?}", status),
+            }
+        }
+
+        #[test]
+        fn test_edit_approval_edit() {
+            let assistant = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/path/to/main.rs","old_string":"foo","new_string":"bar"}}]}}"#;
+            let progress = r#"{"type":"progress","data":{"hookEvent":"PreToolUse"}}"#;
+            let entries = vec![parse_entry(assistant), parse_entry(progress)];
+            let (status, _) = parse_status_from_entries(&entries);
+            match status {
+                ClaudeStatus::EditApproval(file) => {
+                    assert_eq!(file, "main.rs");
+                }
+                _ => panic!("Expected EditApproval, got {:?}", status),
+            }
+        }
+
+        #[test]
+        fn test_plan_review() {
+            let assistant = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"ExitPlanMode","input":{}}]}}"#;
+            let progress = r#"{"type":"progress","data":{"hookEvent":"PreToolUse"}}"#;
+            let entries = vec![parse_entry(assistant), parse_entry(progress)];
+            let (status, _) = parse_status_from_entries(&entries);
+            assert!(matches!(status, ClaudeStatus::PlanReview));
+        }
+
+        #[test]
+        fn test_question_asked() {
+            let assistant = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[]}}]}}"#;
+            let progress = r#"{"type":"progress","data":{"hookEvent":"PreToolUse"}}"#;
+            let entries = vec![parse_entry(assistant), parse_entry(progress)];
+            let (status, _) = parse_status_from_entries(&entries);
+            assert!(matches!(status, ClaudeStatus::QuestionAsked));
+        }
+
+        #[test]
+        fn test_working_state_post_tool() {
+            let progress = r#"{"type":"progress","data":{"hookEvent":"PostToolUse"}}"#;
+            let entries = vec![parse_entry(progress)];
+            let (status, _) = parse_status_from_entries(&entries);
+            assert!(matches!(status, ClaudeStatus::Unknown));
+        }
+
+        #[test]
+        fn test_unknown_no_progress() {
+            let assistant = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}"#;
+            let entries = vec![parse_entry(assistant)];
+            let (status, _) = parse_status_from_entries(&entries);
+            assert!(matches!(status, ClaudeStatus::Unknown));
+        }
+
+        #[test]
+        fn test_task_tool_needs_permission() {
+            let assistant = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Task","input":{"command":"run tests","description":"Run test suite"}}]}}"#;
+            let progress = r#"{"type":"progress","data":{"hookEvent":"PreToolUse"}}"#;
+            let entries = vec![parse_entry(assistant), parse_entry(progress)];
+            let (status, _) = parse_status_from_entries(&entries);
+            match status {
+                ClaudeStatus::NeedsPermission(cmd, desc) => {
+                    assert!(cmd.contains("Bash:"));
+                    assert_eq!(desc, Some("Run test suite".to_string()));
+                }
+                _ => panic!("Expected NeedsPermission, got {:?}", status),
+            }
+        }
+
+        #[test]
+        fn test_other_tool_needs_permission() {
+            let assistant = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"WebFetch","input":{"url":"https://example.com"}}]}}"#;
+            let progress = r#"{"type":"progress","data":{"hookEvent":"PreToolUse"}}"#;
+            let entries = vec![parse_entry(assistant), parse_entry(progress)];
+            let (status, _) = parse_status_from_entries(&entries);
+            match status {
+                ClaudeStatus::NeedsPermission(cmd, _) => {
+                    assert!(cmd.contains("WebFetch:"));
+                }
+                _ => panic!("Expected NeedsPermission, got {:?}", status),
+            }
+        }
+
+        #[test]
+        fn test_timestamp_parsing() {
+            let progress = r#"{"type":"progress","data":{"hookEvent":"Stop"},"timestamp":"2026-01-29T10:30:45Z"}"#;
+            let entries = vec![parse_entry(progress)];
+            let (_, timestamp) = parse_status_from_entries(&entries);
+            assert!(timestamp.is_some());
+            let ts = timestamp.unwrap();
+            assert_eq!(ts.format("%Y-%m-%d").to_string(), "2026-01-29");
+        }
+
+        #[test]
+        fn test_empty_entries() {
+            let entries: Vec<JsonlEntry> = vec![];
+            let (status, timestamp) = parse_status_from_entries(&entries);
+            assert!(matches!(status, ClaudeStatus::Unknown));
+            assert!(timestamp.is_none());
+        }
+    }
 }
