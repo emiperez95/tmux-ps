@@ -757,6 +757,8 @@ struct App {
     last_save: Instant, // Track last save time for periodic saves
     // Stable permission key assignments (session name → key)
     permission_key_map: HashMap<String, char>,
+    // Sessions where we've sent permission approval but jsonl hasn't updated yet
+    pending_approvals: HashSet<String>,
 }
 
 impl App {
@@ -782,6 +784,7 @@ impl App {
             detail_selected: 0,
             last_save: Instant::now(),
             permission_key_map: HashMap::new(),
+            pending_approvals: HashSet::new(),
         }
     }
 
@@ -864,23 +867,38 @@ impl App {
         session_infos.sort_by_key(|s| s.claude_status.is_none());
 
         // Stable permission key assignment
-        // 1. Determine which sessions need permission
+        // 1. Determine which sessions need permission (excluding pending approvals)
         let sessions_needing_permission: HashSet<String> = session_infos
             .iter()
             .filter(|s| {
-                matches!(
-                    s.claude_status,
-                    Some(ClaudeStatus::NeedsPermission(_, _)) | Some(ClaudeStatus::EditApproval(_))
-                )
+                !self.pending_approvals.contains(&s.name)
+                    && matches!(
+                        s.claude_status,
+                        Some(ClaudeStatus::NeedsPermission(_, _))
+                            | Some(ClaudeStatus::EditApproval(_))
+                    )
             })
             .map(|s| s.name.clone())
             .collect();
 
-        // 2. Remove sessions that no longer need permission from the map
+        // 2. Clean up pending approvals for sessions that no longer need permission
+        //    (Claude has processed the approval)
+        self.pending_approvals.retain(|name| {
+            session_infos.iter().any(|s| {
+                &s.name == name
+                    && matches!(
+                        s.claude_status,
+                        Some(ClaudeStatus::NeedsPermission(_, _))
+                            | Some(ClaudeStatus::EditApproval(_))
+                    )
+            })
+        });
+
+        // 3. Remove sessions that no longer need permission from the key map
         self.permission_key_map
             .retain(|name, _| sessions_needing_permission.contains(name));
 
-        // 3. Get currently used keys and find available keys
+        // 4. Get currently used keys and find available keys
         let used_keys: HashSet<char> = self.permission_key_map.values().copied().collect();
         let mut available_keys: Vec<char> = PERMISSION_KEYS
             .iter()
@@ -888,7 +906,7 @@ impl App {
             .copied()
             .collect();
 
-        // 4. Assign keys to sessions that need permission
+        // 5. Assign keys to sessions that need permission
         for session in &mut session_infos {
             if sessions_needing_permission.contains(&session.name) {
                 if let Some(&existing_key) = self.permission_key_map.get(&session.name) {
@@ -1970,6 +1988,9 @@ fn run(terminal: &mut DefaultTerminal, args: Args, running: Arc<AtomicBool>) -> 
                                             send_key_to_pane(sess, win, pane, "1");
                                             send_key_to_pane(sess, win, pane, "Enter");
                                         }
+                                        // Mark as pending so key disappears immediately
+                                        app.pending_approvals
+                                            .insert(session_info.name.clone());
                                         app.hide_selection();
                                         should_refresh = true;
                                         break;
