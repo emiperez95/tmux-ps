@@ -997,14 +997,20 @@ impl App {
         };
 
         // Network
-        self.prev_net_rx = self.net_rx;
-        self.prev_net_tx = self.net_tx;
         let networks = Networks::new_with_refreshed_list();
         let (rx, tx) = networks
             .iter()
             .fold((0u64, 0u64), |(r, t), (_, d)| {
                 (r + d.total_received(), t + d.total_transmitted())
             });
+        // On first refresh, initialize prev to current so delta is 0
+        if self.net_rx == 0 && self.net_tx == 0 {
+            self.prev_net_rx = rx;
+            self.prev_net_tx = tx;
+        } else {
+            self.prev_net_rx = self.net_rx;
+            self.prev_net_tx = self.net_tx;
+        }
         self.net_rx = rx;
         self.net_tx = tx;
 
@@ -1268,7 +1274,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     let (content_area, sidebar_area) = if show_sidebar {
         let h_chunks = Layout::horizontal([
             Constraint::Min(40),
-            Constraint::Length(10),
+            Constraint::Length(24),
         ])
         .split(area);
         (h_chunks[0], Some(h_chunks[1]))
@@ -1442,12 +1448,26 @@ fn render_stats_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(1), // "System"
         Constraint::Length(1), // CPU
         Constraint::Length(1), // MEM
-        Constraint::Length(1), // NET down
-        Constraint::Length(1), // NET up
+        Constraint::Length(1), // NET (down + up)
         Constraint::Length(1), // TMP
         Constraint::Min(0),
     ])
     .split(area);
+
+    // Helper to render a gauge line with label and value
+    let render_gauge = |frame: &mut Frame, area: Rect, label: &str, value: f32, suffix: &str, ratio: f64, color: Color| {
+        // Format: "CPU 45% ████░░" (label 3 + space + value 3 + suffix + space = 9 chars for prefix)
+        let prefix_width = 9;
+        let gauge_width = area.width.saturating_sub(prefix_width) as usize;
+        let filled = ((ratio * gauge_width as f64).round() as usize).min(gauge_width);
+        let unfilled = gauge_width.saturating_sub(filled);
+        let line = Line::from(vec![
+            Span::styled(format!("{} {:3.0}{} ", label, value, suffix), Style::default().fg(color)),
+            Span::styled("█".repeat(filled), Style::default().fg(color)),
+            Span::styled("░".repeat(unfilled), Style::default().fg(Color::DarkGray)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+    };
 
     // Title
     frame.render_widget(
@@ -1463,10 +1483,7 @@ fn render_stats_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Color::Red
     };
-    frame.render_widget(
-        Paragraph::new(format!("CPU {:3.0}%", app.sys_cpu)).style(Style::default().fg(cpu_color)),
-        chunks[1],
-    );
+    render_gauge(frame, chunks[1], "CPU", app.sys_cpu, "%", (app.sys_cpu / 100.0).clamp(0.0, 1.0) as f64, cpu_color);
 
     // MEM
     let mem_color = if app.sys_mem_percent < 60.0 {
@@ -1476,39 +1493,42 @@ fn render_stats_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Color::Red
     };
-    frame.render_widget(
-        Paragraph::new(format!("MEM {:3.0}%", app.sys_mem_percent))
-            .style(Style::default().fg(mem_color)),
-        chunks[2],
-    );
+    render_gauge(frame, chunks[2], "MEM", app.sys_mem_percent as f32, "%", (app.sys_mem_percent / 100.0).clamp(0.0, 1.0), mem_color);
 
     // Network rates (delta since last refresh)
     let rx_rate = app.net_rx.saturating_sub(app.prev_net_rx);
     let tx_rate = app.net_tx.saturating_sub(app.prev_net_tx);
-    frame.render_widget(
-        Paragraph::new(format!("NET ↓{}", format_rate(rx_rate)))
-            .style(Style::default().fg(Color::Cyan)),
-        chunks[3],
-    );
-    frame.render_widget(
-        Paragraph::new(format!("    ↑{}", format_rate(tx_rate)))
-            .style(Style::default().fg(Color::Magenta)),
-        chunks[4],
-    );
+
+    // Color based on throughput: green < 1MB/s, yellow < 5MB/s, red >= 5MB/s
+    let rate_color = |rate: u64| -> Color {
+        if rate < 1_000_000 {
+            Color::Green
+        } else if rate < 5_000_000 {
+            Color::Yellow
+        } else {
+            Color::Red
+        }
+    };
+
+    let net_line = Line::from(vec![
+        Span::styled("NET ", Style::default()),
+        Span::styled(format!("↓{}", format_rate(rx_rate)), Style::default().fg(rate_color(rx_rate))),
+        Span::styled(" ", Style::default()),
+        Span::styled(format!("↑{}", format_rate(tx_rate)), Style::default().fg(rate_color(tx_rate))),
+    ]);
+    frame.render_widget(Paragraph::new(net_line), chunks[3]);
 
     // Temperature (if available)
     if let Some(temp) = app.sys_temp {
-        let temp_color = if temp < 60.0 {
+        let temp_color = if temp < 50.0 {
             Color::Green
-        } else if temp < 80.0 {
+        } else if temp < 70.0 {
             Color::Yellow
         } else {
             Color::Red
         };
-        frame.render_widget(
-            Paragraph::new(format!("TMP {:3.0}°", temp)).style(Style::default().fg(temp_color)),
-            chunks[5],
-        );
+        let temp_ratio = (temp / 100.0).clamp(0.0, 1.0) as f64;
+        render_gauge(frame, chunks[4], "TMP", temp, "°", temp_ratio, temp_color);
     }
 }
 
