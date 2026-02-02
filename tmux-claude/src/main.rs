@@ -763,6 +763,14 @@ enum InputMode {
     Normal,
     ParkNote, // Entering note for parking
     AddTodo,  // Adding a todo in detail view
+    Search,   // Interactive session search
+}
+
+/// Search result item - either an active session or a parked one
+#[derive(Clone)]
+enum SearchResult {
+    Active(usize),    // Index into session_infos
+    Parked(String),   // Session name from parked_sessions
 }
 
 struct App {
@@ -804,6 +812,11 @@ struct App {
     prev_net_rx: u64,
     prev_net_tx: u64,
     sys_temp: Option<f32>,
+    // Search mode
+    search_query: String,
+    search_results: Vec<SearchResult>,
+    // Parked session detail view
+    showing_parked_detail: Option<String>, // parked session name being viewed
 }
 
 impl App {
@@ -838,6 +851,34 @@ impl App {
             prev_net_rx: 0,
             prev_net_tx: 0,
             sys_temp: None,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            showing_parked_detail: None,
+        }
+    }
+
+    /// Update search results based on current query
+    fn update_search_results(&mut self) {
+        self.search_results.clear();
+        let query = self.search_query.to_lowercase();
+
+        // Add matching active sessions
+        for (i, info) in self.session_infos.iter().enumerate() {
+            if query.is_empty() || info.name.to_lowercase().contains(&query) {
+                self.search_results.push(SearchResult::Active(i));
+            }
+        }
+
+        // Add matching parked sessions
+        for name in self.parked_sessions.keys() {
+            if query.is_empty() || name.to_lowercase().contains(&query) {
+                self.search_results.push(SearchResult::Parked(name.clone()));
+            }
+        }
+
+        // Reset selection if out of bounds
+        if self.selected >= self.search_results.len() {
+            self.selected = 0;
         }
     }
 
@@ -977,13 +1018,18 @@ impl App {
 
         self.session_infos = session_infos;
 
-        // Clamp selection if list shrank
-        if !self.session_infos.is_empty() {
-            if self.selected >= self.session_infos.len() {
-                self.selected = self.session_infos.len() - 1;
-            }
+        // Update search results if in search mode (so new sessions appear)
+        if self.input_mode == InputMode::Search {
+            self.update_search_results();
         } else {
-            self.selected = 0;
+            // Clamp selection if list shrank (only in non-search mode)
+            if !self.session_infos.is_empty() {
+                if self.selected >= self.session_infos.len() {
+                    self.selected = self.session_infos.len() - 1;
+                }
+            } else {
+                self.selected = 0;
+            }
         }
 
         // System-wide metrics for sidebar
@@ -1295,12 +1341,16 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
 
     // --- Header ---
     let now = chrono::Local::now();
-    let title = if app.showing_detail.is_some() {
+    let title = if app.input_mode == InputMode::Search {
+        "tmux-claude [SEARCH]".to_string()
+    } else if app.showing_detail.is_some() {
         if let Some(name) = app.detail_session_name() {
             format!("tmux-claude [{}]", name)
         } else {
             "tmux-claude [DETAIL]".to_string()
         }
+    } else if let Some(ref name) = app.showing_parked_detail {
+        format!("tmux-claude [{}]", name)
     } else if app.showing_parked {
         "tmux-claude [PARKED]".to_string()
     } else {
@@ -1321,9 +1371,13 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     ]);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
-    // --- Main content: session list, parked list, or detail view ---
-    if app.showing_detail.is_some() {
+    // --- Main content: session list, parked list, search, or detail view ---
+    if app.input_mode == InputMode::Search {
+        render_search_view(frame, app, chunks[1]);
+    } else if app.showing_detail.is_some() {
         render_detail_view(frame, app, chunks[1]);
+    } else if app.showing_parked_detail.is_some() {
+        render_parked_detail_view(frame, app, chunks[1]);
     } else if app.showing_parked {
         render_parked_view(frame, app, chunks[1]);
     } else {
@@ -1340,7 +1394,19 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     }
 
     // --- Footer ---
-    let footer = if app.input_mode == InputMode::AddTodo {
+    let footer = if app.input_mode == InputMode::Search {
+        // Search mode footer
+        Line::from(vec![
+            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::styled(&app.search_query, Style::default().fg(Color::Yellow)),
+            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::raw("  "),
+            Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("select "),
+            Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("cancel"),
+        ])
+    } else if app.input_mode == InputMode::AddTodo {
         // Todo input mode footer
         Line::from(vec![
             Span::styled("Todo: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -1375,6 +1441,16 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
             Span::raw("switch "),
             Span::styled("[P]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("ark "),
+            Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("back "),
+            Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("uit"),
+        ])
+    } else if app.showing_parked_detail.is_some() {
+        // Parked detail view footer
+        Line::from(vec![
+            Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("unpark "),
             Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("back "),
             Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
@@ -1801,6 +1877,74 @@ fn render_parked_view(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Render the search results view
+fn render_search_view(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::raw("")); // Spacing after header
+
+    if app.search_results.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No matches",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    } else {
+        for (i, result) in app.search_results.iter().enumerate() {
+            let is_selected = i == app.selected;
+            let prefix = if is_selected {
+                Span::styled(">", Style::default().add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw(" ")
+            };
+
+            let style = if is_selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+
+            match result {
+                SearchResult::Active(idx) => {
+                    let info = &app.session_infos[*idx];
+                    let status_text = match &info.claude_status {
+                        Some(ClaudeStatus::NeedsPermission(_, _)) => " [permission]",
+                        Some(ClaudeStatus::EditApproval(_)) => " [edit]",
+                        Some(ClaudeStatus::Waiting) => " [waiting]",
+                        Some(ClaudeStatus::PlanReview) => " [plan]",
+                        Some(ClaudeStatus::QuestionAsked) => " [question]",
+                        Some(ClaudeStatus::Unknown) => " [working]",
+                        None => "",
+                    };
+                    lines.push(Line::from(vec![
+                        prefix,
+                        Span::styled(". ", style),
+                        Span::styled(info.name.clone(), style.add_modifier(Modifier::BOLD)),
+                        Span::styled(status_text, Style::default().fg(Color::Cyan)),
+                    ]));
+                }
+                SearchResult::Parked(name) => {
+                    lines.push(Line::from(vec![
+                        prefix,
+                        Span::styled(". ", style),
+                        Span::styled(name.clone(), style),
+                        Span::styled(" [parked]", Style::default().fg(Color::DarkGray)),
+                    ]));
+                    // Show note on next line if present
+                    if let Some(note) = app.parked_sessions.get(name) {
+                        if !note.is_empty() {
+                            lines.push(Line::from(Span::styled(
+                                format!("   → {}", note),
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 /// Render the session detail view
 fn render_detail_view(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rect) {
     let mut lines: Vec<Line> = Vec::new();
@@ -1907,6 +2051,52 @@ fn render_detail_view(frame: &mut ratatui::Frame, app: &mut App, area: ratatui::
             ]));
         }
     }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Render the parked session detail view
+fn render_parked_detail_view(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::raw("")); // Spacing after header
+
+    let Some(ref name) = app.showing_parked_detail else {
+        return;
+    };
+    let note = app.parked_sessions.get(name).cloned().unwrap_or_default();
+
+    // Session name
+    lines.push(Line::from(vec![
+        Span::styled("Session: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+    ]));
+
+    lines.push(Line::raw("")); // Spacing
+
+    // Note
+    lines.push(Line::from(Span::styled(
+        "Note:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    if note.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no note)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", note),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+
+    lines.push(Line::raw("")); // Spacing
+
+    // Status
+    lines.push(Line::from(vec![
+        Span::styled("Status: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("[parked]", Style::default().fg(Color::DarkGray)),
+    ]));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -2052,6 +2242,58 @@ fn run(terminal: &mut DefaultTerminal, args: Args, running: Arc<AtomicBool>) -> 
                             }
                             _ => {}
                         }
+                    } else if app.input_mode == InputMode::Search {
+                        // Handle search input
+                        match code {
+                            KeyCode::Esc => {
+                                app.input_mode = InputMode::Normal;
+                                app.search_query.clear();
+                                app.search_results.clear();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Enter => {
+                                // Open detail view for selected result
+                                if let Some(result) = app.search_results.get(app.selected).cloned() {
+                                    match result {
+                                        SearchResult::Active(idx) => {
+                                            // Open detail view for active session
+                                            app.open_detail(idx);
+                                        }
+                                        SearchResult::Parked(name) => {
+                                            // Open parked detail view
+                                            app.showing_parked_detail = Some(name);
+                                        }
+                                    }
+                                }
+                                app.input_mode = InputMode::Normal;
+                                app.search_query.clear();
+                                app.search_results.clear();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Backspace => {
+                                app.search_query.pop();
+                                app.update_search_results();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Up => {
+                                if app.selected > 0 {
+                                    app.selected -= 1;
+                                }
+                                needs_redraw = true;
+                            }
+                            KeyCode::Down => {
+                                if app.selected + 1 < app.search_results.len() {
+                                    app.selected += 1;
+                                }
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char(c) => {
+                                app.search_query.push(c);
+                                app.update_search_results();
+                                needs_redraw = true;
+                            }
+                            _ => {}
+                        }
                     } else if app.showing_detail.is_some() {
                         // Handle detail view input
                         match code {
@@ -2113,6 +2355,37 @@ fn run(terminal: &mut DefaultTerminal, args: Args, running: Arc<AtomicBool>) -> 
                             }
                             _ => {}
                         }
+                    } else if app.showing_parked_detail.is_some() {
+                        // Handle parked detail view input
+                        match code {
+                            KeyCode::Esc => {
+                                app.showing_parked_detail = None;
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                app.save_restorable();
+                                return Ok(());
+                            }
+                            KeyCode::Enter => {
+                                // Unpark this session
+                                if let Some(name) = app.showing_parked_detail.take() {
+                                    if sesh_connect(&name) {
+                                        app.parked_sessions.remove(&name);
+                                        save_parked_sessions(&app.parked_sessions);
+                                        should_refresh = true;
+                                        break;
+                                    } else {
+                                        app.error_message = Some((
+                                            format!("Failed to unpark '{}'", name),
+                                            std::time::Instant::now(),
+                                        ));
+                                        app.showing_parked_detail = Some(name);
+                                        needs_redraw = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     } else {
                         // Normal mode input
                         match code {
@@ -2157,6 +2430,14 @@ fn run(terminal: &mut DefaultTerminal, args: Args, running: Arc<AtomicBool>) -> 
                             KeyCode::Char('c') if cfg!(unix) => {
                                 app.save_restorable();
                                 return Ok(());
+                            }
+                            // / : enter search mode
+                            KeyCode::Char('/') => {
+                                app.input_mode = InputMode::Search;
+                                app.search_query.clear();
+                                app.update_search_results();
+                                app.selected = 0;
+                                needs_redraw = true;
                             }
                             // Number keys (1-9): switch to session
                             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
