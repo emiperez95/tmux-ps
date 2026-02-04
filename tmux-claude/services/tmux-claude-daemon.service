@@ -1,0 +1,13 @@
+[Unit]
+Description=tmux-claude daemon for Claude session monitoring
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=__BINARY_PATH__ daemon
+Restart=on-failure
+RestartSec=5
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
