@@ -2,8 +2,8 @@
 
 use crate::common::debug::debug_log;
 use crate::common::persistence::{
-    has_sesh_config, load_parked_sessions, load_session_todos, save_parked_sessions,
-    save_restorable_sessions, save_session_todos, sesh_connect,
+    has_sesh_config, list_sesh_projects, load_parked_sessions, load_session_todos,
+    save_parked_sessions, save_restorable_sessions, save_session_todos, sesh_connect,
 };
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::tmux::{get_tmux_sessions, kill_tmux_session};
@@ -27,11 +27,12 @@ pub enum InputMode {
     Search,   // Interactive session search
 }
 
-/// Search result item - either an active session or a parked one
+/// Search result item - active session, parked one, or inactive sesh project
 #[derive(Clone)]
 pub enum SearchResult {
-    Active(usize),  // Index into session_infos
-    Parked(String), // Session name from parked_sessions
+    Active(usize),      // Index into session_infos
+    Parked(String),     // Session name from parked_sessions
+    SeshProject(String), // Sesh project name (not active, not parked)
 }
 
 /// TUI application state
@@ -72,6 +73,8 @@ pub struct App {
     // Search mode
     pub search_query: String,
     pub search_results: Vec<SearchResult>,
+    pub search_scroll_offset: usize, // Scroll offset for search results
+    pub sesh_projects: Vec<String>,  // Cached list of all sesh projects
     // Parked session detail view
     pub showing_parked_detail: Option<String>, // parked session name being viewed
     // Daemon client (optional - falls back to JSONL polling if None)
@@ -112,6 +115,8 @@ impl App {
             metrics_history: None,
             search_query: String::new(),
             search_results: Vec::new(),
+            search_scroll_offset: 0,
+            sesh_projects: Vec::new(), // Loaded on demand when entering search mode
             showing_parked_detail: None,
             daemon_client: if daemon_connected {
                 Some(daemon_client)
@@ -138,6 +143,13 @@ impl App {
         self.search_results.clear();
         let query = self.search_query.to_lowercase();
 
+        // Collect active session names for deduplication
+        let active_names: HashSet<String> = self
+            .session_infos
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+
         // Add matching active sessions
         for (i, info) in self.session_infos.iter().enumerate() {
             if query.is_empty() || info.name.to_lowercase().contains(&query) {
@@ -152,9 +164,69 @@ impl App {
             }
         }
 
+        // Add matching sesh projects that are not active and not parked
+        for name in &self.sesh_projects {
+            // Skip if already active or parked
+            if active_names.contains(name) || self.parked_sessions.contains_key(name) {
+                continue;
+            }
+            if query.is_empty() || name.to_lowercase().contains(&query) {
+                self.search_results.push(SearchResult::SeshProject(name.clone()));
+            }
+        }
+
         // Reset selection if out of bounds
         if self.selected >= self.search_results.len() {
             self.selected = 0;
+        }
+    }
+
+    /// Load sesh projects list (called when entering search mode)
+    pub fn load_sesh_projects(&mut self) {
+        self.sesh_projects = list_sesh_projects();
+    }
+
+    /// Calculate lines needed to display a search result
+    fn lines_for_search_result(&self, result: &SearchResult) -> usize {
+        match result {
+            SearchResult::Active(_) => 1,
+            SearchResult::Parked(name) => {
+                // Parked sessions with notes take 2 lines
+                if let Some(note) = self.parked_sessions.get(name) {
+                    if !note.is_empty() {
+                        return 2;
+                    }
+                }
+                1
+            }
+            SearchResult::SeshProject(_) => 1,
+        }
+    }
+
+    /// Ensure the selected search result is visible within the available height
+    pub fn ensure_search_visible(&mut self, available_height: usize) {
+        if available_height == 0 || self.search_results.is_empty() {
+            return;
+        }
+
+        // Scroll up if selected is above viewport
+        if self.selected < self.search_scroll_offset {
+            self.search_scroll_offset = self.selected;
+        }
+
+        // Scroll down if selected is below viewport
+        loop {
+            let mut used = 0;
+            for i in self.search_scroll_offset..=self.selected.min(self.search_results.len() - 1) {
+                used += self.lines_for_search_result(&self.search_results[i]);
+            }
+            if used <= available_height {
+                break;
+            }
+            self.search_scroll_offset += 1;
+            if self.search_scroll_offset >= self.search_results.len() {
+                break;
+            }
         }
     }
 

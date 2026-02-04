@@ -245,17 +245,46 @@ fn run_tui(
                                         SearchResult::Active(idx) => {
                                             // Open detail view for active session
                                             app.open_detail(idx);
+                                            app.input_mode = InputMode::Normal;
+                                            app.search_query.clear();
+                                            app.search_results.clear();
+                                            needs_redraw = true;
                                         }
                                         SearchResult::Parked(name) => {
                                             // Open parked detail view
                                             app.showing_parked_detail = Some(name);
+                                            app.input_mode = InputMode::Normal;
+                                            app.search_query.clear();
+                                            app.search_results.clear();
+                                            needs_redraw = true;
+                                        }
+                                        SearchResult::SeshProject(name) => {
+                                            // Connect to sesh project and exit
+                                            app.input_mode = InputMode::Normal;
+                                            app.search_query.clear();
+                                            app.search_results.clear();
+                                            if sesh_connect(&name) {
+                                                if app.popup_mode {
+                                                    app.save_restorable();
+                                                    return Ok(());
+                                                }
+                                                should_refresh = true;
+                                                break;
+                                            } else {
+                                                app.error_message = Some((
+                                                    format!("Failed to connect to '{}'", name),
+                                                    std::time::Instant::now(),
+                                                ));
+                                                needs_redraw = true;
+                                            }
                                         }
                                     }
+                                } else {
+                                    app.input_mode = InputMode::Normal;
+                                    app.search_query.clear();
+                                    app.search_results.clear();
+                                    needs_redraw = true;
                                 }
-                                app.input_mode = InputMode::Normal;
-                                app.search_query.clear();
-                                app.search_results.clear();
-                                needs_redraw = true;
                             }
                             KeyCode::Backspace => {
                                 app.search_query.pop();
@@ -425,6 +454,8 @@ fn run_tui(
                             KeyCode::Char('/') => {
                                 app.input_mode = InputMode::Search;
                                 app.search_query.clear();
+                                app.search_scroll_offset = 0;
+                                app.load_sesh_projects(); // Load sesh projects on search mode entry
                                 app.update_search_results();
                                 app.selected = 0;
                                 needs_redraw = true;

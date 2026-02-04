@@ -151,3 +151,17 @@ pub fn sesh_connect(name: &str) -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
+
+/// List configured sesh project names (from sesh.toml only, not zoxide history)
+pub fn list_sesh_projects() -> Vec<String> {
+    Command::new("sesh")
+        .args(["list", "--config"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}

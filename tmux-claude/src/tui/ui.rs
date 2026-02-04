@@ -933,7 +933,12 @@ pub fn render_parked_view(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Render the search results view
-pub fn render_search_view(frame: &mut Frame, app: &App, area: Rect) {
+pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
+    let available_height = area.height as usize;
+
+    // Ensure selected item is visible
+    app.ensure_search_visible(available_height.saturating_sub(1)); // -1 for spacing line
+
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw("")); // Spacing after header
 
@@ -943,8 +948,12 @@ pub fn render_search_view(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::DIM),
         )));
     } else {
-        for (i, result) in app.search_results.iter().enumerate() {
-            let is_selected = i == app.selected;
+        let mut lines_remaining = available_height.saturating_sub(1);
+        let mut idx = app.search_scroll_offset;
+
+        while idx < app.search_results.len() && lines_remaining > 0 {
+            let result = &app.search_results[idx];
+            let is_selected = idx == app.selected;
             let prefix = if is_selected {
                 Span::styled(">", Style::default().add_modifier(Modifier::BOLD))
             } else {
@@ -958,8 +967,8 @@ pub fn render_search_view(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             match result {
-                SearchResult::Active(idx) => {
-                    let info = &app.session_infos[*idx];
+                SearchResult::Active(session_idx) => {
+                    let info = &app.session_infos[*session_idx];
                     let status_text = match &info.claude_status {
                         Some(ClaudeStatus::NeedsPermission(_, _)) => " [permission]",
                         Some(ClaudeStatus::EditApproval(_)) => " [edit]",
@@ -975,27 +984,52 @@ pub fn render_search_view(frame: &mut Frame, app: &App, area: Rect) {
                         Span::styled(info.name.clone(), style.add_modifier(Modifier::BOLD)),
                         Span::styled(status_text, Style::default().fg(Color::Cyan)),
                     ]));
+                    lines_remaining -= 1;
                 }
                 SearchResult::Parked(name) => {
+                    // Check if we have room for this item (may need 2 lines for note)
+                    let has_note = app
+                        .parked_sessions
+                        .get(name)
+                        .map(|n| !n.is_empty())
+                        .unwrap_or(false);
+                    let needed = if has_note { 2 } else { 1 };
+                    if lines_remaining < needed {
+                        break;
+                    }
+
                     lines.push(Line::from(vec![
                         prefix,
                         Span::styled(". ", style),
                         Span::styled(name.clone(), style),
                         Span::styled(" [parked]", Style::default().fg(Color::DarkGray)),
                     ]));
+                    lines_remaining -= 1;
+
                     // Show note on next line if present
-                    if let Some(note) = app.parked_sessions.get(name) {
-                        if !note.is_empty() {
+                    if has_note {
+                        if let Some(note) = app.parked_sessions.get(name) {
                             lines.push(Line::from(Span::styled(
                                 format!("   → {}", note),
                                 Style::default()
                                     .fg(Color::Cyan)
                                     .add_modifier(Modifier::DIM),
                             )));
+                            lines_remaining -= 1;
                         }
                     }
                 }
+                SearchResult::SeshProject(name) => {
+                    lines.push(Line::from(vec![
+                        prefix,
+                        Span::styled(". ", style),
+                        Span::styled(name.clone(), style),
+                        Span::styled(" [sesh]", Style::default().fg(Color::Cyan)),
+                    ]));
+                    lines_remaining -= 1;
+                }
             }
+            idx += 1;
         }
     }
 
