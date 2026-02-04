@@ -1,7 +1,6 @@
 //! Process detection and resource monitoring.
 
 use crate::common::types::ProcessInfo;
-use std::process::Command;
 use sysinfo::{Pid, System};
 
 /// Check if a process is Claude Code based on name/command
@@ -71,42 +70,6 @@ pub fn get_process_info(sys: &System, pid: u32) -> Option<ProcessInfo> {
             command: cmd,
         }
     })
-}
-
-/// Get CPU temperature (platform-specific)
-#[cfg(target_os = "macos")]
-pub fn get_cpu_temperature() -> Option<f32> {
-    // On macOS, use ioreg to get battery temperature (works on Apple Silicon)
-    // This is a proxy for system temperature and doesn't require special crates
-    let output = Command::new("ioreg")
-        .args(["-rc", "AppleSmartBattery"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if line.contains("\"Temperature\"") {
-            // Format: "Temperature" = 3084  (centi-Celsius)
-            if let Some(val) = line.split('=').nth(1) {
-                if let Ok(centi) = val.trim().parse::<f32>() {
-                    return Some(centi / 100.0);
-                }
-            }
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn get_cpu_temperature() -> Option<f32> {
-    use sysinfo::Components;
-    let components = Components::new_with_refreshed_list();
-    components
-        .iter()
-        .find(|c| {
-            let label = c.label().to_lowercase();
-            label.contains("cpu") || label.contains("core")
-        })
-        .map(|c| c.temperature())
 }
 
 #[cfg(test)]

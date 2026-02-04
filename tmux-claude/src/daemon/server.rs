@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::sync::Arc;
 use std::time::Instant;
+use sysinfo::{Networks, System};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, RwLock};
@@ -77,6 +78,23 @@ impl DaemonServer {
                 interval.tick().await;
                 let mut state = state_clone.write().await;
                 state.cleanup_old_approvals();
+            }
+        });
+
+        // Spawn metrics collection task (every 5 seconds)
+        let state_clone = self.state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            let mut sys = System::new_all();
+            let mut networks = Networks::new_with_refreshed_list();
+
+            loop {
+                interval.tick().await;
+                sys.refresh_all();
+                networks.refresh();
+
+                let mut state = state_clone.write().await;
+                state.metrics.collect_sample(&sys, &networks);
             }
         });
 
@@ -172,6 +190,7 @@ async fn handle_command(
             DaemonResponse::State {
                 sessions: state.all_sessions(),
                 daemon_uptime_secs: start_time.elapsed().as_secs(),
+                metrics: Some(state.metrics.get_history()),
             }
         }
 

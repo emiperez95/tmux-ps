@@ -3,14 +3,22 @@
 use crate::common::types::{
     format_duration_ago, format_memory, format_rate, lines_for_session, ClaudeStatus,
 };
+use crate::ipc::messages::MetricsHistory;
 use crate::tui::app::{App, InputMode, SearchResult};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols::Marker,
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph},
     Frame,
 };
+
+/// Sparkline characters from lowest to highest
+const SPARKLINE_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Width of the stats sidebar (doubled for sparklines)
+const STATS_SIDEBAR_WIDTH: u16 = 48;
 
 /// Build the ratatui UI
 pub fn ui(frame: &mut Frame, app: &mut App) {
@@ -18,9 +26,9 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     // Sidebar: show if enabled and terminal is wide enough
-    let show_sidebar = app.show_stats && area.width >= 60;
+    let show_sidebar = app.show_stats && area.width >= 80;
     let (content_area, sidebar_area) = if show_sidebar {
-        let h_chunks = Layout::horizontal([Constraint::Min(40), Constraint::Length(24)]).split(area);
+        let h_chunks = Layout::horizontal([Constraint::Min(40), Constraint::Length(STATS_SIDEBAR_WIDTH)]).split(area);
         (h_chunks[0], Some(h_chunks[1]))
     } else {
         (area, None)
@@ -231,120 +239,396 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Render the system stats sidebar
-pub fn render_stats_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::vertical([
-        Constraint::Length(1), // "System"
-        Constraint::Length(1), // CPU
-        Constraint::Length(1), // MEM
-        Constraint::Length(1), // NET (down + up)
-        Constraint::Length(1), // TMP
-        Constraint::Min(0),
-    ])
-    .split(area);
-
-    // Helper to render a gauge line with label and value
-    let render_gauge =
-        |frame: &mut Frame, area: Rect, label: &str, value: f32, suffix: &str, ratio: f64, color: Color| {
-            // Format: "CPU 45% ████░░" (label 3 + space + value 3 + suffix + space = 9 chars for prefix)
-            let prefix_width = 9;
-            let gauge_width = area.width.saturating_sub(prefix_width) as usize;
-            let filled = ((ratio * gauge_width as f64).round() as usize).min(gauge_width);
-            let unfilled = gauge_width.saturating_sub(filled);
-            let line = Line::from(vec![
-                Span::styled(
-                    format!("{} {:3.0}{} ", label, value, suffix),
-                    Style::default().fg(color),
-                ),
-                Span::styled("█".repeat(filled), Style::default().fg(color)),
-                Span::styled("░".repeat(unfilled), Style::default().fg(Color::DarkGray)),
-            ]);
-            frame.render_widget(Paragraph::new(line), area);
-        };
-
-    // Title
-    frame.render_widget(
-        Paragraph::new("System").style(Style::default().add_modifier(Modifier::BOLD)),
-        chunks[0],
-    );
-
-    // CPU
-    let cpu_color = if app.sys_cpu < 50.0 {
-        Color::Green
-    } else if app.sys_cpu < 80.0 {
-        Color::Yellow
-    } else {
-        Color::Red
-    };
-    render_gauge(
-        frame,
-        chunks[1],
-        "CPU",
-        app.sys_cpu,
-        "%",
-        (app.sys_cpu / 100.0).clamp(0.0, 1.0) as f64,
-        cpu_color,
-    );
-
-    // MEM
-    let mem_color = if app.sys_mem_percent < 60.0 {
-        Color::Green
-    } else if app.sys_mem_percent < 85.0 {
-        Color::Yellow
-    } else {
-        Color::Red
-    };
-    render_gauge(
-        frame,
-        chunks[2],
-        "MEM",
-        app.sys_mem_percent as f32,
-        "%",
-        (app.sys_mem_percent / 100.0).clamp(0.0, 1.0),
-        mem_color,
-    );
-
-    // Network rates (delta since last refresh)
-    let rx_rate = app.net_rx.saturating_sub(app.prev_net_rx);
-    let tx_rate = app.net_tx.saturating_sub(app.prev_net_tx);
-
-    // Color based on throughput: green < 1MB/s, yellow < 5MB/s, red >= 5MB/s
-    let rate_color = |rate: u64| -> Color {
-        if rate < 1_000_000 {
-            Color::Green
-        } else if rate < 5_000_000 {
-            Color::Yellow
-        } else {
-            Color::Red
-        }
-    };
-
-    let net_line = Line::from(vec![
-        Span::styled("NET ", Style::default()),
-        Span::styled(
-            format!("↓{}", format_rate(rx_rate)),
-            Style::default().fg(rate_color(rx_rate)),
-        ),
-        Span::styled(" ", Style::default()),
-        Span::styled(
-            format!("↑{}", format_rate(tx_rate)),
-            Style::default().fg(rate_color(tx_rate)),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(net_line), chunks[3]);
-
-    // Temperature (if available)
-    if let Some(temp) = app.sys_temp {
-        let temp_color = if temp < 50.0 {
-            Color::Green
-        } else if temp < 70.0 {
-            Color::Yellow
-        } else {
-            Color::Red
-        };
-        let temp_ratio = (temp / 100.0).clamp(0.0, 1.0) as f64;
-        render_gauge(frame, chunks[4], "TMP", temp, "°", temp_ratio, temp_color);
+/// Downsample a f32 history vector to fit the target width
+fn downsample_f32(history: &[f32], target_width: usize) -> Vec<f64> {
+    if history.is_empty() || target_width == 0 {
+        return vec![];
     }
+
+    if history.len() <= target_width {
+        return history.iter().map(|&v| v as f64).collect();
+    }
+
+    // Downsample by averaging chunks
+    let chunk_size = history.len() as f64 / target_width as f64;
+    let mut result = Vec::with_capacity(target_width);
+
+    for i in 0..target_width {
+        let start = (i as f64 * chunk_size) as usize;
+        let end = ((i + 1) as f64 * chunk_size).ceil() as usize;
+        let end = end.min(history.len());
+
+        let sum: f64 = history[start..end].iter().map(|&v| v as f64).sum();
+        let count = (end - start) as f64;
+        result.push(if count > 0.0 { sum / count } else { 0.0 });
+    }
+
+    result
+}
+
+/// Downsample a f64 history vector to fit the target width
+fn downsample_f64(history: &[f64], target_width: usize) -> Vec<f64> {
+    if history.is_empty() || target_width == 0 {
+        return vec![];
+    }
+
+    if history.len() <= target_width {
+        return history.to_vec();
+    }
+
+    // Downsample by averaging chunks
+    let chunk_size = history.len() as f64 / target_width as f64;
+    let mut result = Vec::with_capacity(target_width);
+
+    for i in 0..target_width {
+        let start = (i as f64 * chunk_size) as usize;
+        let end = ((i + 1) as f64 * chunk_size).ceil() as usize;
+        let end = end.min(history.len());
+
+        let sum: f64 = history[start..end].iter().sum();
+        let count = (end - start) as f64;
+        result.push(if count > 0.0 { sum / count } else { 0.0 });
+    }
+
+    result
+}
+
+/// Downsample a u64 history vector to fit the target width
+fn downsample_u64(history: &[u64], target_width: usize) -> Vec<f64> {
+    if history.is_empty() || target_width == 0 {
+        return vec![];
+    }
+
+    if history.len() <= target_width {
+        return history.iter().map(|&v| v as f64).collect();
+    }
+
+    // Downsample by averaging chunks
+    let chunk_size = history.len() as f64 / target_width as f64;
+    let mut result = Vec::with_capacity(target_width);
+
+    for i in 0..target_width {
+        let start = (i as f64 * chunk_size) as usize;
+        let end = ((i + 1) as f64 * chunk_size).ceil() as usize;
+        let end = end.min(history.len());
+
+        let sum: f64 = history[start..end].iter().map(|&v| v as f64).sum();
+        let count = (end - start) as f64;
+        result.push(if count > 0.0 { sum / count } else { 0.0 });
+    }
+
+    result
+}
+
+/// Convert values to sparkline string
+fn values_to_sparkline(values: &[f64], min_val: f64, max_val: f64) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+
+    let range = max_val - min_val;
+    values
+        .iter()
+        .map(|&v| {
+            if range <= 0.0 {
+                SPARKLINE_CHARS[0]
+            } else {
+                let normalized = ((v - min_val) / range).clamp(0.0, 1.0);
+                let idx = (normalized * 7.0).round() as usize;
+                SPARKLINE_CHARS[idx.min(7)]
+            }
+        })
+        .collect()
+}
+
+/// Get color based on current value and thresholds
+fn threshold_color(value: f64, low: f64, high: f64) -> Color {
+    if value < low {
+        Color::Green
+    } else if value < high {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+/// Render the system stats sidebar with line charts like btm
+pub fn render_stats_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+    // Check if we have metrics from daemon
+    if let Some(ref metrics) = app.metrics_history {
+        render_chart_metrics(frame, area, metrics);
+    } else {
+        // No daemon connection - show message
+        let chunks = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+        frame.render_widget(
+            Paragraph::new("System").style(Style::default().add_modifier(Modifier::BOLD)),
+            chunks[0],
+        );
+        render_no_daemon_message(frame, &chunks);
+    }
+}
+
+/// Convert history to chart data points (x = time index, y = value)
+fn history_to_points(history: &[f64], max_points: usize) -> Vec<(f64, f64)> {
+    if history.is_empty() {
+        return vec![];
+    }
+
+    let step = if history.len() > max_points {
+        history.len() as f64 / max_points as f64
+    } else {
+        1.0
+    };
+
+    let mut points = Vec::new();
+    let mut i = 0.0;
+    while (i as usize) < history.len() {
+        let idx = i as usize;
+        let x = idx as f64 / history.len().max(1) as f64 * 100.0; // Normalize to 0-100
+        points.push((x, history[idx]));
+        i += step;
+    }
+    points
+}
+
+/// Render chart-based metrics like btm
+fn render_chart_metrics(frame: &mut Frame, area: Rect, metrics: &MetricsHistory) {
+    // Split into 4 chart areas (CPU, MEM, NET, TMP)
+    let has_temp = !metrics.temp.is_empty();
+    let chunks = if has_temp {
+        Layout::vertical([
+            Constraint::Ratio(1, 4), // CPU
+            Constraint::Ratio(1, 4), // MEM
+            Constraint::Ratio(1, 4), // NET
+            Constraint::Ratio(1, 4), // TMP
+        ])
+        .split(area)
+    } else {
+        Layout::vertical([
+            Constraint::Ratio(1, 3), // CPU
+            Constraint::Ratio(1, 3), // MEM
+            Constraint::Ratio(1, 3), // NET
+        ])
+        .split(area)
+    };
+
+    let max_points = area.width as usize;
+
+    // CPU Chart
+    let cpu_current = metrics.cpu.last().copied().unwrap_or(0.0);
+    let cpu_color = threshold_color(cpu_current as f64, 50.0, 80.0);
+    let cpu_data: Vec<f64> = metrics.cpu.iter().map(|&v| v as f64).collect();
+    let cpu_points = history_to_points(&cpu_data, max_points);
+
+    let cpu_dataset = Dataset::default()
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(cpu_color))
+        .data(&cpu_points);
+
+    let cpu_chart = Chart::new(vec![cpu_dataset])
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::LEFT)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    format!(" CPU {:5.1}% ", cpu_current),
+                    Style::default().fg(cpu_color).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .x_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .labels(vec![
+                    Span::styled("30m", Style::default().fg(Color::DarkGray)),
+                    Span::styled("now", Style::default().fg(Color::DarkGray)),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .labels(vec![
+                    Span::styled("0%", Style::default().fg(Color::DarkGray)),
+                    Span::styled("100%", Style::default().fg(Color::DarkGray)),
+                ]),
+        );
+    frame.render_widget(cpu_chart, chunks[0]);
+
+    // MEM Chart
+    let mem_current = metrics.mem.last().copied().unwrap_or(0.0);
+    let mem_color = threshold_color(mem_current, 60.0, 85.0);
+    let mem_points = history_to_points(&metrics.mem, max_points);
+
+    let mem_dataset = Dataset::default()
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(mem_color))
+        .data(&mem_points);
+
+    let mem_chart = Chart::new(vec![mem_dataset])
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::LEFT)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    format!(" MEM {:5.1}% ", mem_current),
+                    Style::default().fg(mem_color).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .x_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .labels(vec![
+                    Span::styled("30m", Style::default().fg(Color::DarkGray)),
+                    Span::styled("now", Style::default().fg(Color::DarkGray)),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .labels(vec![
+                    Span::styled("0%", Style::default().fg(Color::DarkGray)),
+                    Span::styled("100%", Style::default().fg(Color::DarkGray)),
+                ]),
+        );
+    frame.render_widget(mem_chart, chunks[1]);
+
+    // NET Chart (RX and TX combined)
+    let rx_current = metrics.net_rx.last().copied().unwrap_or(0);
+    let tx_current = metrics.net_tx.last().copied().unwrap_or(0);
+    let rx_data: Vec<f64> = metrics.net_rx.iter().map(|&v| v as f64).collect();
+    let tx_data: Vec<f64> = metrics.net_tx.iter().map(|&v| v as f64).collect();
+    let rx_points = history_to_points(&rx_data, max_points);
+    let tx_points = history_to_points(&tx_data, max_points);
+
+    // Find max for scaling
+    let net_max = rx_data
+        .iter()
+        .chain(tx_data.iter())
+        .copied()
+        .fold(1.0_f64, f64::max);
+
+    // Normalize points to 0-100 range for display
+    let rx_normalized: Vec<(f64, f64)> = rx_points
+        .iter()
+        .map(|(x, y)| (*x, y / net_max * 100.0))
+        .collect();
+    let tx_normalized: Vec<(f64, f64)> = tx_points
+        .iter()
+        .map(|(x, y)| (*x, y / net_max * 100.0))
+        .collect();
+
+    let rx_dataset = Dataset::default()
+        .name("↓")
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Cyan))
+        .data(&rx_normalized);
+
+    let tx_dataset = Dataset::default()
+        .name("↑")
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Magenta))
+        .data(&tx_normalized);
+
+    let net_chart = Chart::new(vec![rx_dataset, tx_dataset])
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::LEFT)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    format!(" NET ↓{} ↑{} ", format_rate(rx_current), format_rate(tx_current)),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .x_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .labels(vec![
+                    Span::styled("30m", Style::default().fg(Color::DarkGray)),
+                    Span::styled("now", Style::default().fg(Color::DarkGray)),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .labels(vec![
+                    Span::styled("0", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format_rate(net_max as u64), Style::default().fg(Color::DarkGray)),
+                ]),
+        );
+    frame.render_widget(net_chart, chunks[2]);
+
+    // TMP Chart (if available)
+    if has_temp {
+        let temp_current = metrics.temp.last().copied().unwrap_or(0.0);
+        let temp_color = threshold_color(temp_current as f64, 50.0, 70.0);
+        let temp_data: Vec<f64> = metrics.temp.iter().map(|&v| v as f64).collect();
+        let temp_points = history_to_points(&temp_data, max_points);
+
+        // Normalize temp to 0-100 range (20-100°C -> 0-100)
+        let temp_normalized: Vec<(f64, f64)> = temp_points
+            .iter()
+            .map(|(x, y)| (*x, (y - 20.0).max(0.0) / 80.0 * 100.0))
+            .collect();
+
+        let temp_dataset = Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(temp_color))
+            .data(&temp_normalized);
+
+        let temp_chart = Chart::new(vec![temp_dataset])
+            .block(
+                Block::default()
+                    .borders(Borders::TOP | Borders::LEFT)
+                    .border_style(Style::default().fg(Color::DarkGray))
+                    .title(Span::styled(
+                        format!(" TMP {:5.1}°C ", temp_current),
+                        Style::default().fg(temp_color).add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .x_axis(
+                Axis::default()
+                    .bounds([0.0, 100.0])
+                    .labels(vec![
+                        Span::styled("30m", Style::default().fg(Color::DarkGray)),
+                        Span::styled("now", Style::default().fg(Color::DarkGray)),
+                    ]),
+            )
+            .y_axis(
+                Axis::default()
+                    .bounds([0.0, 100.0])
+                    .labels(vec![
+                        Span::styled("20°C", Style::default().fg(Color::DarkGray)),
+                        Span::styled("100°C", Style::default().fg(Color::DarkGray)),
+                    ]),
+            );
+        frame.render_widget(temp_chart, chunks[3]);
+    }
+}
+
+/// Render message when daemon not connected
+fn render_no_daemon_message(frame: &mut Frame, chunks: &[Rect]) {
+    let msg = Line::from(Span::styled(
+        "Daemon not connected",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+    ));
+    frame.render_widget(Paragraph::new(msg), chunks[1]);
+
+    let hint = Line::from(Span::styled(
+        "Run: tmux-claude daemon start",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+    ));
+    frame.render_widget(Paragraph::new(hint), chunks[2]);
 }
 
 /// Render the normal session list view

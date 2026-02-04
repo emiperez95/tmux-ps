@@ -154,6 +154,21 @@ pub enum SessionStatus {
     Unknown,
 }
 
+/// Historical metrics data for sparkline display
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetricsHistory {
+    /// CPU usage history (percentage, 0-100)
+    pub cpu: Vec<f32>,
+    /// Memory usage history (percentage, 0-100)
+    pub mem: Vec<f64>,
+    /// Network RX rate history (bytes/sec)
+    pub net_rx: Vec<u64>,
+    /// Network TX rate history (bytes/sec)
+    pub net_tx: Vec<u64>,
+    /// Temperature history (celsius)
+    pub temp: Vec<f32>,
+}
+
 /// Response from daemon to TUI/CLI
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DaemonResponse {
@@ -161,6 +176,9 @@ pub enum DaemonResponse {
     State {
         sessions: Vec<SessionState>,
         daemon_uptime_secs: u64,
+        /// System metrics history for sparkline display
+        #[serde(default)]
+        metrics: Option<MetricsHistory>,
     },
     /// Real-time state update (sent to subscribers)
     StateUpdate {

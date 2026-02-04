@@ -1,6 +1,6 @@
 //! TUI client for daemon communication.
 
-use crate::ipc::messages::{get_socket_path, DaemonCommand, DaemonResponse, SessionState};
+use crate::ipc::messages::{get_socket_path, DaemonCommand, DaemonResponse, MetricsHistory, SessionState};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -70,10 +70,18 @@ impl DaemonClient {
         serde_json::from_str(&line).ok()
     }
 
-    /// Get current state from daemon
+    /// Get current state from daemon (sessions only)
     pub fn get_state(&mut self) -> Option<Vec<SessionState>> {
         match self.send_command(DaemonCommand::GetState)? {
             DaemonResponse::State { sessions, .. } => Some(sessions),
+            _ => None,
+        }
+    }
+
+    /// Get current state with metrics from daemon
+    pub fn get_state_with_metrics(&mut self) -> Option<(Vec<SessionState>, Option<MetricsHistory>)> {
+        match self.send_command(DaemonCommand::GetState)? {
+            DaemonResponse::State { sessions, metrics, .. } => Some((sessions, metrics)),
             _ => None,
         }
     }

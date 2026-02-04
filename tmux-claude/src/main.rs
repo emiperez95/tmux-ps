@@ -49,16 +49,31 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Start the background daemon
-    Daemon,
+    /// Daemon management (start, stop, status, restart)
+    Daemon {
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
+    },
     /// Open the TUI (default behavior)
     Tui,
-    /// Check daemon status
+    /// Check daemon status (shortcut for `daemon status`)
     Status,
     /// Register hooks in ~/.claude/settings.json
     Setup,
-    /// Stop the running daemon
+    /// Stop the running daemon (shortcut for `daemon stop`)
     Stop,
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonAction {
+    /// Start the daemon (default)
+    Start,
+    /// Stop the daemon
+    Stop,
+    /// Show daemon status
+    Status,
+    /// Restart the daemon (stop + start)
+    Restart,
 }
 
 fn run_tui(
@@ -482,8 +497,51 @@ fn run_tui(
     }
 }
 
-/// Run the daemon
-fn run_daemon() -> Result<()> {
+const LAUNCHD_LABEL: &str = "com.tmux-claude.daemon";
+
+/// Get the launchd plist path
+fn get_launchd_plist_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join("Library/LaunchAgents").join(format!("{}.plist", LAUNCHD_LABEL)))
+}
+
+/// Load (start) daemon via launchctl
+fn launchctl_load() -> Result<()> {
+    let plist = get_launchd_plist_path().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+
+    let output = std::process::Command::new("launchctl")
+        .args(["load", plist.to_str().unwrap()])
+        .output()?;
+
+    if !output.status.success() {
+        // Already loaded is not an error
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("already loaded") {
+            anyhow::bail!("launchctl load failed: {}", stderr);
+        }
+    }
+    Ok(())
+}
+
+/// Unload (stop) daemon via launchctl
+fn launchctl_unload() -> Result<()> {
+    let plist = get_launchd_plist_path().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+
+    let output = std::process::Command::new("launchctl")
+        .args(["unload", plist.to_str().unwrap()])
+        .output()?;
+
+    if !output.status.success() {
+        // Not loaded is not an error for stop
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("Could not find") {
+            anyhow::bail!("launchctl unload failed: {}", stderr);
+        }
+    }
+    Ok(())
+}
+
+/// Run the daemon directly (used when not managed by launchd)
+fn run_daemon_direct() -> Result<()> {
     use crate::daemon::server::DaemonServer;
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -491,6 +549,35 @@ fn run_daemon() -> Result<()> {
         let server = DaemonServer::new();
         server.run().await
     })
+}
+
+/// Run the daemon (start via launchctl if registered, otherwise run directly)
+fn run_daemon() -> Result<()> {
+    use crate::daemon::server::is_daemon_running;
+
+    // If already running, just report it
+    if is_daemon_running() {
+        println!("Daemon is already running");
+        return Ok(());
+    }
+
+    // If launchd plist exists, use launchctl load
+    if get_launchd_plist_path().map(|p| p.exists()).unwrap_or(false) {
+        println!("Starting daemon via launchctl...");
+        launchctl_load()?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        if is_daemon_running() {
+            println!("Daemon started");
+        } else {
+            println!("Warning: launchctl load succeeded but daemon not responding");
+        }
+        return Ok(());
+    }
+
+    // Otherwise run directly (foreground)
+    println!("Starting daemon (foreground)...");
+    run_daemon_direct()
 }
 
 /// Check and print daemon status
@@ -525,12 +612,74 @@ fn run_stop() -> Result<()> {
         return Ok(());
     }
 
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        crate::daemon::server::stop_daemon().await?;
+    // If launchd plist exists, unload it first to prevent auto-restart
+    let has_launchd = get_launchd_plist_path().map(|p| p.exists()).unwrap_or(false);
+    if has_launchd {
+        println!("Unloading launchd service...");
+        launchctl_unload()?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // Send shutdown command via socket (may fail if already stopped by unload)
+    if is_daemon_running() {
+        println!("Stopping daemon...");
+        let runtime = tokio::runtime::Runtime::new()?;
+        let _ = runtime.block_on(async {
+            crate::daemon::server::stop_daemon().await
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    if !is_daemon_running() {
         println!("Daemon stopped");
-        Ok(())
-    })
+    } else {
+        println!("Warning: daemon still responding");
+    }
+    Ok(())
+}
+
+/// Restart the daemon (stop + start)
+fn run_restart() -> Result<()> {
+    use crate::daemon::server::is_daemon_running;
+
+    let has_launchd = get_launchd_plist_path().map(|p| p.exists()).unwrap_or(false);
+
+    // Stop the running daemon
+    if is_daemon_running() {
+        if has_launchd {
+            println!("Unloading launchd service...");
+            launchctl_unload()?;
+            // Give it time to stop after unload
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+
+        // Try socket shutdown (may fail if already stopped by unload)
+        if is_daemon_running() {
+            println!("Stopping daemon...");
+            let runtime = tokio::runtime::Runtime::new()?;
+            let _ = runtime.block_on(async {
+                crate::daemon::server::stop_daemon().await
+            });
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    // Start the daemon
+    if has_launchd {
+        println!("Starting daemon via launchctl...");
+        launchctl_load()?;
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+
+        if is_daemon_running() {
+            println!("Daemon restarted");
+        } else {
+            println!("Warning: daemon may not have started properly");
+        }
+        return Ok(());
+    }
+
+    println!("Starting daemon (foreground)...");
+    run_daemon_direct()
 }
 
 /// Setup hooks and system service
@@ -701,7 +850,13 @@ fn main() -> Result<()> {
     init_debug(args.debug);
 
     match args.command {
-        Some(Command::Daemon) => run_daemon(),
+        Some(Command::Daemon { action }) => match action {
+            Some(DaemonAction::Stop) => run_stop(),
+            Some(DaemonAction::Status) => run_status(),
+            Some(DaemonAction::Restart) => run_restart(),
+            Some(DaemonAction::Start) => run_daemon(),
+            None => run_daemon_direct(), // No subcommand = run directly (for launchd)
+        },
         Some(Command::Status) => run_status(),
         Some(Command::Stop) => run_stop(),
         Some(Command::Setup) => run_setup(),

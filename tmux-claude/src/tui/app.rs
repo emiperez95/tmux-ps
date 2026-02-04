@@ -5,20 +5,18 @@ use crate::common::persistence::{
     has_sesh_config, load_parked_sessions, load_session_todos, save_parked_sessions,
     save_restorable_sessions, save_session_todos, sesh_connect,
 };
-use crate::common::process::{
-    get_all_descendants, get_cpu_temperature, get_process_info, is_claude_process,
-};
+use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::tmux::{get_tmux_sessions, kill_tmux_session};
 use crate::common::types::{
     lines_for_session, matches_filter, ClaudeStatus, SessionInfo, PERMISSION_KEYS,
 };
-use crate::ipc::messages::SessionStatus;
+use crate::ipc::messages::{MetricsHistory, SessionStatus};
 use crate::tui::client::DaemonClient;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-use sysinfo::{Networks, System};
+use sysinfo::System;
 
 /// Text input mode for the TUI
 #[derive(Debug, PartialEq)]
@@ -69,13 +67,8 @@ pub struct App {
     pub pending_approvals: HashSet<String>,
     // System stats sidebar
     pub show_stats: bool,
-    pub sys_cpu: f32,
-    pub sys_mem_percent: f64,
-    pub net_rx: u64,
-    pub net_tx: u64,
-    pub prev_net_rx: u64,
-    pub prev_net_tx: u64,
-    pub sys_temp: Option<f32>,
+    /// Historical metrics from daemon (for sparklines)
+    pub metrics_history: Option<MetricsHistory>,
     // Search mode
     pub search_query: String,
     pub search_results: Vec<SearchResult>,
@@ -116,13 +109,7 @@ impl App {
             permission_key_map: HashMap::new(),
             pending_approvals: HashSet::new(),
             show_stats: true,
-            sys_cpu: 0.0,
-            sys_mem_percent: 0.0,
-            net_rx: 0,
-            net_tx: 0,
-            prev_net_rx: 0,
-            prev_net_tx: 0,
-            sys_temp: None,
+            metrics_history: None,
             search_query: String::new(),
             search_results: Vec::new(),
             showing_parked_detail: None,
@@ -176,18 +163,23 @@ impl App {
         let mut sys = System::new_all();
         sys.refresh_all();
 
-        // Get daemon state if connected (for Claude status)
+        // Get daemon state if connected (for Claude status and metrics)
         // Index by cwd since hooks don't know tmux session names
-        let daemon_sessions: HashMap<String, _> = if let Some(client) = &mut self.daemon_client {
-            client
-                .get_state()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|s| (s.cwd.clone(), s))
-                .collect()
-        } else {
-            HashMap::new()
-        };
+        let (daemon_sessions, daemon_metrics): (HashMap<String, _>, Option<MetricsHistory>) =
+            if let Some(client) = &mut self.daemon_client {
+                match client.get_state_with_metrics() {
+                    Some((sessions, metrics)) => (
+                        sessions.into_iter().map(|s| (s.cwd.clone(), s)).collect(),
+                        metrics,
+                    ),
+                    None => (HashMap::new(), None),
+                }
+            } else {
+                (HashMap::new(), None)
+            };
+
+        // Store metrics from daemon
+        self.metrics_history = daemon_metrics;
 
         let using_daemon = !daemon_sessions.is_empty();
         if using_daemon {
@@ -372,35 +364,6 @@ impl App {
                 self.selected = 0;
             }
         }
-
-        // System-wide metrics for sidebar
-        self.sys_cpu = sys.global_cpu_usage();
-        let mem_used = sys.used_memory();
-        let mem_total = sys.total_memory();
-        self.sys_mem_percent = if mem_total > 0 {
-            (mem_used as f64 / mem_total as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        // Network
-        let networks = Networks::new_with_refreshed_list();
-        let (rx, tx) = networks.iter().fold((0u64, 0u64), |(r, t), (_, d)| {
-            (r + d.total_received(), t + d.total_transmitted())
-        });
-        // On first refresh, initialize prev to current so delta is 0
-        if self.net_rx == 0 && self.net_tx == 0 {
-            self.prev_net_rx = rx;
-            self.prev_net_tx = tx;
-        } else {
-            self.prev_net_rx = self.net_rx;
-            self.prev_net_tx = self.net_tx;
-        }
-        self.net_rx = rx;
-        self.net_tx = tx;
-
-        // Temperature
-        self.sys_temp = get_cpu_temperature();
 
         Ok(())
     }
