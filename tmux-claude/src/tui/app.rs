@@ -2,8 +2,9 @@
 
 use crate::common::debug::debug_log;
 use crate::common::persistence::{
-    has_sesh_config, list_sesh_projects, load_parked_sessions, load_session_todos,
-    save_parked_sessions, save_restorable_sessions, save_session_todos, sesh_connect,
+    has_sesh_config, list_sesh_projects, load_auto_approve_sessions, load_parked_sessions,
+    load_session_todos, save_auto_approve_sessions, save_parked_sessions,
+    save_restorable_sessions, save_session_todos, sesh_connect,
 };
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::tmux::{get_tmux_sessions, kill_tmux_session};
@@ -81,6 +82,8 @@ pub struct App {
     pub daemon_client: Option<DaemonClient>,
     // Track if we're connected to daemon (for UI indicator)
     pub daemon_connected: bool,
+    // Per-session auto-approve toggle
+    pub auto_approve_sessions: HashSet<String>,
 }
 
 impl App {
@@ -124,6 +127,7 @@ impl App {
                 None
             },
             daemon_connected,
+            auto_approve_sessions: load_auto_approve_sessions(),
         }
     }
 
@@ -678,6 +682,33 @@ impl App {
             self.save_restorable();
             self.last_save = Instant::now();
         }
+    }
+
+    /// Toggle auto-approve for a session by index
+    pub fn toggle_auto_approve(&mut self, idx: usize) {
+        let Some(session_info) = self.session_infos.get(idx) else {
+            return;
+        };
+        let name = session_info.name.clone();
+        if self.auto_approve_sessions.contains(&name) {
+            self.auto_approve_sessions.remove(&name);
+            self.error_message = Some((
+                format!("Auto-approve OFF for '{}'", name),
+                Instant::now(),
+            ));
+        } else {
+            self.auto_approve_sessions.insert(name.clone());
+            self.error_message = Some((
+                format!("Auto-approve ON for '{}'", name),
+                Instant::now(),
+            ));
+        }
+        save_auto_approve_sessions(&self.auto_approve_sessions);
+    }
+
+    /// Check if a session has auto-approve enabled
+    pub fn is_auto_approved(&self, name: &str) -> bool {
+        self.auto_approve_sessions.contains(name)
     }
 }
 

@@ -158,6 +158,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("switch "),
             Span::styled("[P]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("ark "),
+            Span::styled("[!]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("auto "),
             Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("back "),
             Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
@@ -729,6 +731,11 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 ));
             }
 
+            // Add auto-approve badge
+            if app.is_auto_approved(&session_info.name) {
+                header_spans.push(Span::styled(" [auto]", Style::default().fg(Color::Green)));
+            }
+
             lines.push(Line::from(header_spans));
 
             // Status line
@@ -868,6 +875,11 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     format!(" [{}]", todo_count),
                     Style::default().fg(Color::Cyan),
                 ));
+            }
+
+            // Add auto-approve badge
+            if app.is_auto_approved(&session_info.name) {
+                header_spans.push(Span::styled(" [auto]", Style::default().fg(Color::Green)));
             }
 
             lines.push(Line::from(header_spans));

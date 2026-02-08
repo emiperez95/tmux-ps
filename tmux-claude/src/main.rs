@@ -372,6 +372,13 @@ fn run_tui(
                                     needs_redraw = true;
                                 }
                             }
+                            KeyCode::Char('!') => {
+                                // Toggle auto-approve for this session
+                                if let Some(idx) = app.showing_detail {
+                                    app.toggle_auto_approve(idx);
+                                    needs_redraw = true;
+                                }
+                            }
                             _ => {}
                         }
                     } else if app.showing_parked_detail.is_some() {

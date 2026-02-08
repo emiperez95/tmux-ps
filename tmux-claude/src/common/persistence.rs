@@ -1,6 +1,6 @@
 //! File persistence for parked sessions, todos, and session restore.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -164,4 +164,39 @@ pub fn list_sesh_projects() -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Get the path to the auto-approve sessions file
+pub fn get_auto_approve_file_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|p| p.join("tmux-claude").join("auto-approve.txt"))
+}
+
+/// Load auto-approve session names from disk
+pub fn load_auto_approve_sessions() -> HashSet<String> {
+    let Some(path) = get_auto_approve_file_path() else {
+        return HashSet::new();
+    };
+    let Ok(file) = fs::File::open(&path) else {
+        return HashSet::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .collect()
+}
+
+/// Save auto-approve session names to disk
+pub fn save_auto_approve_sessions(sessions: &HashSet<String>) {
+    let Some(path) = get_auto_approve_file_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::File::create(&path) {
+        for name in sessions {
+            let _ = writeln!(file, "{}", name);
+        }
+    }
 }
