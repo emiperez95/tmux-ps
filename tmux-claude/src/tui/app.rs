@@ -3,9 +3,10 @@
 use crate::common::debug::debug_log;
 use crate::common::persistence::{
     has_sesh_config, is_globally_muted, list_sesh_projects, load_auto_approve_sessions,
-    load_muted_sessions, load_parked_sessions, load_session_todos, save_auto_approve_sessions,
-    save_muted_sessions, save_parked_sessions, save_restorable_sessions, save_session_todos,
-    set_global_mute, sesh_connect,
+    load_muted_sessions, load_parked_sessions, load_session_todos, load_skipped_sessions,
+    save_auto_approve_sessions, save_muted_sessions, save_parked_sessions,
+    save_restorable_sessions, save_session_todos, save_skipped_sessions, set_global_mute,
+    sesh_connect,
 };
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::tmux::{get_tmux_sessions, kill_tmux_session};
@@ -90,6 +91,8 @@ pub struct App {
     // Per-session notification mute
     pub muted_sessions: HashSet<String>,
     pub global_mute: bool,
+    // Per-session skip from cycling
+    pub skipped_sessions: HashSet<String>,
     // Auto-open detail view on first refresh
     pub auto_detail: bool,
 }
@@ -145,6 +148,7 @@ impl App {
             auto_approve_sessions: load_auto_approve_sessions(),
             muted_sessions: load_muted_sessions(),
             global_mute: is_globally_muted(),
+            skipped_sessions: load_skipped_sessions(),
             auto_detail: false,
         }
     }
@@ -380,8 +384,12 @@ impl App {
             });
         }
 
-        // Sort: Claude sessions first, then non-Claude (stable preserves order within groups)
-        session_infos.sort_by_key(|s| s.claude_status.is_none());
+        // Sort: Claude (non-skipped) → non-Claude (non-skipped) → skipped
+        // Within each group, stable sort preserves original order
+        session_infos.sort_by_key(|s| {
+            let is_skipped = self.skipped_sessions.contains(&s.name);
+            (is_skipped, s.claude_status.is_none())
+        });
 
         // Stable permission key assignment
         // 1. Determine which sessions need permission (excluding pending approvals)
@@ -783,6 +791,33 @@ impl App {
         } else {
             self.error_message = Some(("Global mute OFF".to_string(), Instant::now()));
         }
+    }
+
+    /// Toggle skip (exclude from cycling) for a session by index
+    pub fn toggle_skip(&mut self, idx: usize) {
+        let Some(session_info) = self.session_infos.get(idx) else {
+            return;
+        };
+        let name = session_info.name.clone();
+        if self.skipped_sessions.contains(&name) {
+            self.skipped_sessions.remove(&name);
+            self.error_message = Some((
+                format!("Cycling ON for '{}'", name),
+                Instant::now(),
+            ));
+        } else {
+            self.skipped_sessions.insert(name.clone());
+            self.error_message = Some((
+                format!("Cycling OFF for '{}'", name),
+                Instant::now(),
+            ));
+        }
+        save_skipped_sessions(&self.skipped_sessions);
+    }
+
+    /// Check if a session is skipped from cycling
+    pub fn is_skipped(&self, name: &str) -> bool {
+        self.skipped_sessions.contains(name)
     }
 }
 

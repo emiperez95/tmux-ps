@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::common::debug::{debug_log, init_debug};
-use crate::common::persistence::{load_restorable_sessions, save_parked_sessions, sesh_connect};
+use crate::common::persistence::{
+    load_restorable_sessions, load_skipped_sessions, save_parked_sessions, sesh_connect,
+};
 use crate::common::tmux::{
     get_current_tmux_session, get_current_tmux_session_names, switch_to_session,
 };
@@ -66,6 +68,10 @@ enum Command {
     Setup,
     /// Stop the running daemon (shortcut for `daemon stop`)
     Stop,
+    /// Cycle to next tmux session (skipping skipped sessions)
+    CycleNext,
+    /// Cycle to previous tmux session (skipping skipped sessions)
+    CyclePrev,
 }
 
 #[derive(Subcommand, Debug)]
@@ -378,7 +384,8 @@ fn run_tui(
                                     && c != 'a'
                                     && c != 'd'
                                     && c != 'm'
-                                    && c != 'p' =>
+                                    && c != 'p'
+                                    && c != 's' =>
                             {
                                 let idx = (c as u8 - b'a') as usize;
                                 let count = app.detail_todos().len();
@@ -418,6 +425,13 @@ fn run_tui(
                                 // Toggle mute for this session
                                 if let Some(idx) = app.showing_detail {
                                     app.toggle_mute(idx);
+                                    needs_redraw = true;
+                                }
+                            }
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                // Toggle skip (exclude from cycling) for this session
+                                if let Some(idx) = app.showing_detail {
+                                    app.toggle_skip(idx);
                                     needs_redraw = true;
                                 }
                             }
@@ -929,6 +943,49 @@ fn install_system_service(home: &std::path::Path, binary_path: &std::path::Path)
     Ok(())
 }
 
+/// Cycle to next/prev tmux session, skipping skipped sessions
+fn run_cycle(forward: bool) -> Result<()> {
+    let skipped = load_skipped_sessions();
+    let all_sessions = get_current_tmux_session_names();
+
+    // Filter out skipped sessions
+    let filtered: Vec<&String> = all_sessions
+        .iter()
+        .filter(|name| !skipped.contains(*name))
+        .collect();
+
+    if filtered.is_empty() {
+        return Ok(());
+    }
+
+    let current = get_current_tmux_session();
+
+    // Find current session in the filtered list
+    let current_idx = current
+        .as_ref()
+        .and_then(|c| filtered.iter().position(|name| *name == c));
+
+    let target = match current_idx {
+        Some(idx) => {
+            if filtered.len() <= 1 {
+                return Ok(()); // Only current session in list, nothing to cycle to
+            }
+            if forward {
+                filtered[(idx + 1) % filtered.len()]
+            } else {
+                filtered[(idx + filtered.len() - 1) % filtered.len()]
+            }
+        }
+        None => {
+            // Current session not in filtered list (maybe it's skipped) → go to first
+            filtered[0]
+        }
+    };
+
+    switch_to_session(target);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     init_debug(args.debug);
@@ -944,6 +1001,8 @@ fn main() -> Result<()> {
         Some(Command::Status) => run_status(),
         Some(Command::Stop) => run_stop(),
         Some(Command::Setup) => run_setup(),
+        Some(Command::CycleNext) => run_cycle(true),
+        Some(Command::CyclePrev) => run_cycle(false),
         Some(Command::Tui) | None => {
             // Check for sessions to restore BEFORE starting TUI (skip in popup mode)
             if !args.popup {

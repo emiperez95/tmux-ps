@@ -236,6 +236,41 @@ pub fn save_muted_sessions(sessions: &HashSet<String>) {
     }
 }
 
+/// Get the path to the skipped sessions file
+pub fn get_skipped_file_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|p| p.join("tmux-claude").join("skipped.txt"))
+}
+
+/// Load skipped session names from disk
+pub fn load_skipped_sessions() -> HashSet<String> {
+    let Some(path) = get_skipped_file_path() else {
+        return HashSet::new();
+    };
+    let Ok(file) = fs::File::open(&path) else {
+        return HashSet::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .collect()
+}
+
+/// Save skipped session names to disk
+pub fn save_skipped_sessions(sessions: &HashSet<String>) {
+    let Some(path) = get_skipped_file_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::File::create(&path) {
+        for name in sessions {
+            let _ = writeln!(file, "{}", name);
+        }
+    }
+}
+
 /// Get the path to the global mute flag file
 pub fn get_global_mute_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|p| p.join("tmux-claude").join("muted-global"))

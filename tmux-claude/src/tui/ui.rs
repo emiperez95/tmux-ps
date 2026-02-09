@@ -171,6 +171,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("auto "),
             Span::styled("[M]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("ute "),
+            Span::styled("[S]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("kip "),
             Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("back "),
             Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
@@ -656,13 +658,60 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
     // Adjust scroll_offset so the selected session is visible
     app.ensure_visible(available_height);
 
+    // Find section boundaries (sorted: claude non-skipped → non-claude non-skipped → skipped)
+    let non_claude_start = app
+        .session_infos
+        .iter()
+        .position(|s| !app.is_skipped(&s.name) && s.claude_status.is_none());
+    let skipped_start = app
+        .session_infos
+        .iter()
+        .position(|s| app.is_skipped(&s.name));
+
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw("")); // Spacing after header
     let mut lines_remaining = available_height.saturating_sub(1);
     let mut idx = app.scroll_offset;
+    let mut shown_non_claude_divider = false;
+    let mut shown_skipped_divider = false;
 
     while idx < app.session_infos.len() {
         let session_info = &app.session_infos[idx];
+        let is_skipped = app.is_skipped(&session_info.name);
+        let is_claude = session_info.claude_status.is_some();
+
+        // Show divider before first non-claude (non-skipped) session
+        if !is_skipped && !is_claude && !shown_non_claude_divider && non_claude_start == Some(idx) {
+            shown_non_claude_divider = true;
+            if lines_remaining < 2 {
+                break;
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "── other ──",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            )));
+            lines_remaining -= 2;
+        }
+
+        // Show divider before first skipped session
+        if is_skipped && !shown_skipped_divider && skipped_start == Some(idx) {
+            shown_skipped_divider = true;
+            if lines_remaining < 2 {
+                break;
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "── skipped ──",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            )));
+            lines_remaining -= 2;
+        }
+
         let needed = lines_for_session(session_info);
         if lines_remaining < needed {
             break;
@@ -672,7 +721,6 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let is_selected = app.show_selection && idx == app.selected;
         let is_pending_park =
             app.input_mode == InputMode::ParkNote && app.pending_park_session == Some(idx);
-        let is_claude = session_info.claude_status.is_some();
 
         // CPU styling
         let cpu_text = format!("{:.1}%", session_info.total_cpu);
@@ -719,6 +767,8 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(Color::Yellow)
             } else if is_selected {
                 Style::default().add_modifier(Modifier::REVERSED)
+            } else if is_skipped {
+                Style::default().add_modifier(Modifier::DIM)
             } else {
                 Style::default()
             };
@@ -1145,6 +1195,9 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if app.is_muted(&session_info.name) {
         flag_spans.push(Span::styled("[muted] ", Style::default().fg(Color::DarkGray)));
+    }
+    if app.is_skipped(&session_info.name) {
+        flag_spans.push(Span::styled("[skip-cycling] ", Style::default().fg(Color::DarkGray)));
     }
     if !flag_spans.is_empty() {
         flag_spans.insert(0, Span::styled("Flags: ", Style::default().add_modifier(Modifier::DIM)));
