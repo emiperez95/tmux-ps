@@ -391,6 +391,10 @@ fn run_tui(
                                 // Switch to this session
                                 if let Some(name) = app.detail_session_name() {
                                     switch_to_session(&name);
+                                    if app.popup_mode {
+                                        app.save_restorable();
+                                        return Ok(());
+                                    }
                                     app.close_detail();
                                     needs_redraw = true;
                                 }
