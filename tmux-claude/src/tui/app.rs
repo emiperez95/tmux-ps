@@ -335,38 +335,34 @@ impl App {
 
             'outer: for window in &session.windows {
                 for p in &window.panes {
-                    // Check if daemon has state for this pane's cwd
-                    if let Some(daemon_state) = daemon_sessions.get(&p.cwd) {
-                        claude_status = Some(convert_daemon_status(&daemon_state.status));
+                    // Check if a Claude process is actually running in this pane
+                    let mut pane_pids = vec![p.pid];
+                    get_all_descendants(&self.sys, p.pid, &mut pane_pids);
+
+                    let has_claude_process = pane_pids.iter().any(|&pid| {
+                        get_process_info(&self.sys, pid)
+                            .map(|info| is_claude_process(&info))
+                            .unwrap_or(false)
+                    });
+
+                    if has_claude_process {
+                        // Use daemon state if available (richer status info)
+                        if let Some(daemon_state) = daemon_sessions.get(&p.cwd) {
+                            claude_status = Some(convert_daemon_status(&daemon_state.status));
+                            last_activity = daemon_state
+                                .last_activity
+                                .as_ref()
+                                .and_then(|s| parse_timestamp(s));
+                        } else {
+                            // Claude running but no daemon state yet - show as working
+                            claude_status = Some(ClaudeStatus::Unknown);
+                        }
                         claude_pane = Some((
                             session.name.clone(),
                             window.index.clone(),
                             p.index.clone(),
                         ));
-                        last_activity = daemon_state
-                            .last_activity
-                            .as_ref()
-                            .and_then(|s| parse_timestamp(s));
                         break 'outer;
-                    }
-
-                    // No daemon state - check if Claude process is running
-                    let mut pane_pids = vec![p.pid];
-                    get_all_descendants(&self.sys, p.pid, &mut pane_pids);
-
-                    for &pid in &pane_pids {
-                        if let Some(info) = get_process_info(&self.sys, pid) {
-                            if is_claude_process(&info) {
-                                // Claude running but no daemon state yet - show as working
-                                claude_status = Some(ClaudeStatus::Unknown);
-                                claude_pane = Some((
-                                    session.name.clone(),
-                                    window.index.clone(),
-                                    p.index.clone(),
-                                ));
-                                break 'outer;
-                            }
-                        }
                     }
                 }
             }
