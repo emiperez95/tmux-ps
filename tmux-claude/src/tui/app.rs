@@ -90,6 +90,8 @@ pub struct App {
     // Per-session notification mute
     pub muted_sessions: HashSet<String>,
     pub global_mute: bool,
+    // Auto-open detail view on first refresh
+    pub auto_detail: bool,
 }
 
 impl App {
@@ -143,6 +145,7 @@ impl App {
             auto_approve_sessions: load_auto_approve_sessions(),
             muted_sessions: load_muted_sessions(),
             global_mute: is_globally_muted(),
+            auto_detail: false,
         }
     }
 

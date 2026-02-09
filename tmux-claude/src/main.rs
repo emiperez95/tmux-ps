@@ -42,8 +42,12 @@ struct Args {
     #[arg(short, long, global = true)]
     popup: bool,
 
+    /// Open detail view for the current tmux session on startup
+    #[arg(short = 'D', long, global = true)]
+    detail: bool,
+
     /// Enable debug logging to ~/.cache/tmux-claude/debug.log
-    #[arg(short, long, global = true)]
+    #[arg(long, global = true)]
     debug: bool,
 }
 
@@ -82,6 +86,7 @@ fn run_tui(
     running: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut app = App::new(args.filter.clone(), args.watch, args.popup);
+    app.auto_detail = args.detail;
 
     loop {
         // Check for signal-based exit
@@ -95,6 +100,26 @@ fn run_tui(
             app.refresh()?;
             // Periodic save check (every 10 minutes)
             app.maybe_periodic_save();
+        }
+
+        // Auto-open detail view for current tmux session (once, after first refresh)
+        if app.auto_detail {
+            app.auto_detail = false;
+            if let Some(current) = get_current_tmux_session() {
+                if let Some(idx) = app.session_infos.iter().position(|s| s.name == current) {
+                    app.open_detail(idx);
+                } else {
+                    app.error_message = Some((
+                        format!("Session '{}' not found in list", current),
+                        std::time::Instant::now(),
+                    ));
+                }
+            } else {
+                app.error_message = Some((
+                    "Could not detect current tmux session".to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
         }
 
         // 2. Draw UI
