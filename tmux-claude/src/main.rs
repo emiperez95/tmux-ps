@@ -332,6 +332,8 @@ fn run_tui(
                             KeyCode::Up | KeyCode::Char('k') => {
                                 if app.detail_selected > 0 {
                                     app.detail_selected -= 1;
+                                } else if app.detail_scroll_offset > 0 {
+                                    app.detail_scroll_offset -= 1;
                                 }
                                 needs_redraw = true;
                             }
@@ -339,6 +341,9 @@ fn run_tui(
                                 let count = app.detail_todos().len();
                                 if count > 0 && app.detail_selected < count - 1 {
                                     app.detail_selected += 1;
+                                } else {
+                                    // Scroll down when at bottom of todo list
+                                    app.detail_scroll_offset += 1;
                                 }
                                 needs_redraw = true;
                             }

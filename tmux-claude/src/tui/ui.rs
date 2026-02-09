@@ -1,7 +1,8 @@
 //! TUI rendering functions.
 
 use crate::common::types::{
-    format_duration_ago, format_memory, format_rate, lines_for_session, ClaudeStatus,
+    format_duration_ago, format_memory, format_rate, lines_for_session, truncate_command,
+    ClaudeStatus,
 };
 use crate::ipc::messages::MetricsHistory;
 use crate::tui::app::{App, InputMode, SearchResult};
@@ -1180,7 +1181,98 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    frame.render_widget(Paragraph::new(lines), area);
+    lines.push(Line::raw("")); // Spacing
+
+    // --- Processes section ---
+    lines.push(Line::from(Span::styled(
+        "Processes:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+
+    let processes = &session_info.processes;
+    // Prepare CWD prefix for making paths relative (with trailing slash)
+    let cwd_prefix = session_info.cwd.as_ref().map(|c| {
+        if c.ends_with('/') { c.clone() } else { format!("{}/", c) }
+    });
+    if processes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no active processes)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    } else {
+        let max_cmd_width = (area.width as usize).saturating_sub(40); // Reserve space for PID, CPU, MEM, name
+        for proc in processes {
+            let pid_text = format!("PID {:>5}", proc.pid);
+            let cpu_text = format!("{:>5.1}%", proc.cpu_percent);
+            let proc_cpu_color = if proc.cpu_percent < 10.0 {
+                Color::Green
+            } else if proc.cpu_percent < 50.0 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+
+            let mem_text = format!("{:>5}", format_memory(proc.memory_kb));
+            let proc_mem_color = if proc.memory_kb < 102400 {
+                // <100M
+                Color::Green
+            } else if proc.memory_kb < 512000 {
+                // <500M
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+
+            // Truncate process name to 15 chars
+            let proc_name = if proc.name.len() > 15 {
+                format!("({}...)", &proc.name[..12])
+            } else {
+                format!("({})", proc.name)
+            };
+
+            // Strip session CWD from command to show relative paths
+            let cmd_relative = match &cwd_prefix {
+                Some(prefix) => proc.command.replace(prefix, "./"),
+                None => proc.command.clone(),
+            };
+            let cmd_display = truncate_command(&cmd_relative, max_cmd_width.max(10));
+
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(pid_text, Style::default().add_modifier(Modifier::DIM)),
+                Span::raw("  "),
+                Span::styled(cpu_text, Style::default().fg(proc_cpu_color)),
+                Span::raw("  "),
+                Span::styled(mem_text, Style::default().fg(proc_mem_color)),
+                Span::raw("  "),
+                Span::styled(proc_name, Style::default().add_modifier(Modifier::DIM)),
+                Span::raw(" "),
+                Span::styled(cmd_display, Style::default().add_modifier(Modifier::DIM)),
+            ]));
+        }
+    }
+
+    // Apply scroll offset
+    let available_height = area.height as usize;
+    let total_lines = lines.len();
+
+    // Clamp scroll offset
+    if total_lines > available_height {
+        let max_scroll = total_lines.saturating_sub(available_height);
+        if app.detail_scroll_offset > max_scroll {
+            app.detail_scroll_offset = max_scroll;
+        }
+    } else {
+        app.detail_scroll_offset = 0;
+    }
+
+    let visible_lines: Vec<Line> = lines
+        .into_iter()
+        .skip(app.detail_scroll_offset)
+        .take(available_height)
+        .collect();
+
+    frame.render_widget(Paragraph::new(visible_lines), area);
 }
 
 /// Render the parked session detail view

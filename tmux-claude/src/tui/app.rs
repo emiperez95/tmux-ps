@@ -10,7 +10,7 @@ use crate::common::persistence::{
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::tmux::{get_tmux_sessions, kill_tmux_session};
 use crate::common::types::{
-    lines_for_session, matches_filter, ClaudeStatus, SessionInfo, PERMISSION_KEYS,
+    lines_for_session, matches_filter, ClaudeStatus, ProcessInfo, SessionInfo, PERMISSION_KEYS,
 };
 use crate::ipc::messages::{MetricsHistory, SessionStatus};
 use crate::tui::client::DaemonClient;
@@ -39,6 +39,7 @@ pub enum SearchResult {
 
 /// TUI application state
 pub struct App {
+    pub sys: System,
     pub session_infos: Vec<SessionInfo>,
     pub filter: Option<String>,
     pub interval: u64,
@@ -62,6 +63,7 @@ pub struct App {
     // Detail view
     pub showing_detail: Option<usize>, // session index being viewed
     pub detail_selected: usize,        // selected todo index in detail view
+    pub detail_scroll_offset: usize,   // scroll offset for detail view content
     // Session restore
     pub last_save: Instant, // Track last save time for periodic saves
     // Stable permission key assignments (session name -> key)
@@ -96,7 +98,13 @@ impl App {
         let mut daemon_client = DaemonClient::new();
         let daemon_connected = daemon_client.connect();
 
+        // Create persistent System instance - needs two refresh_all() calls
+        // to establish baseline for CPU delta measurements
+        let mut sys = System::new_all();
+        sys.refresh_all();
+
         Self {
+            sys,
             session_infos: Vec::new(),
             filter,
             interval,
@@ -115,6 +123,7 @@ impl App {
             session_todos: load_session_todos(),
             showing_detail: None,
             detail_selected: 0,
+            detail_scroll_offset: 0,
             last_save: Instant::now(),
             permission_key_map: HashMap::new(),
             pending_approvals: HashSet::new(),
@@ -242,8 +251,7 @@ impl App {
 
     /// Refresh session data (gather from tmux + sysinfo, with daemon state overlay)
     pub fn refresh(&mut self) -> Result<()> {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        self.sys.refresh_all();
 
         // Get daemon state if connected (for Claude status and metrics)
         // Index by cwd since hooks don't know tmux session names
@@ -279,24 +287,39 @@ impl App {
                 continue;
             }
 
-            // Calculate session totals
+            // Get session CWD from first pane
+            let session_cwd = session
+                .windows
+                .first()
+                .and_then(|w| w.panes.first())
+                .map(|p| p.cwd.clone());
+
+            // Calculate session totals and collect per-process info
             let mut all_pids = Vec::new();
             for window in &session.windows {
                 for pane in &window.panes {
                     all_pids.push(pane.pid);
-                    get_all_descendants(&sys, pane.pid, &mut all_pids);
+                    get_all_descendants(&self.sys, pane.pid, &mut all_pids);
                 }
             }
 
             let mut total_cpu = 0.0;
             let mut total_mem_kb = 0u64;
+            let mut processes: Vec<ProcessInfo> = Vec::new();
 
             for &pid in &all_pids {
-                if let Some(info) = get_process_info(&sys, pid) {
+                if let Some(info) = get_process_info(&self.sys, pid) {
                     total_cpu += info.cpu_percent;
                     total_mem_kb += info.memory_kb;
+                    // Keep processes with >0 CPU or >1MB memory
+                    if info.cpu_percent > 0.0 || info.memory_kb >= 1024 {
+                        processes.push(info);
+                    }
                 }
             }
+
+            // Sort processes by CPU descending
+            processes.sort_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(std::cmp::Ordering::Equal));
 
             // Find Claude pane: check daemon state by cwd, or detect Claude process
             let mut claude_status: Option<ClaudeStatus> = None;
@@ -322,10 +345,10 @@ impl App {
 
                     // No daemon state - check if Claude process is running
                     let mut pane_pids = vec![p.pid];
-                    get_all_descendants(&sys, p.pid, &mut pane_pids);
+                    get_all_descendants(&self.sys, p.pid, &mut pane_pids);
 
                     for &pid in &pane_pids {
-                        if let Some(info) = get_process_info(&sys, pid) {
+                        if let Some(info) = get_process_info(&self.sys, pid) {
                             if is_claude_process(&info) {
                                 // Claude running but no daemon state yet - show as working
                                 claude_status = Some(ClaudeStatus::Unknown);
@@ -349,6 +372,8 @@ impl App {
                 total_cpu,
                 total_mem_kb,
                 last_activity,
+                processes,
+                cwd: session_cwd,
             });
         }
 
@@ -586,6 +611,7 @@ impl App {
         if idx < self.session_infos.len() {
             self.showing_detail = Some(idx);
             self.detail_selected = 0;
+            self.detail_scroll_offset = 0;
         }
     }
 
@@ -593,6 +619,7 @@ impl App {
     pub fn close_detail(&mut self) {
         self.showing_detail = None;
         self.detail_selected = 0;
+        self.detail_scroll_offset = 0;
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
     }

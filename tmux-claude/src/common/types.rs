@@ -80,6 +80,10 @@ pub struct SessionInfo {
     pub total_mem_kb: u64,
     /// timestamp of last jsonl entry
     pub last_activity: Option<DateTime<Utc>>,
+    /// Individual processes running in this session (filtered: >0 CPU or >1MB mem)
+    pub processes: Vec<ProcessInfo>,
+    /// Working directory of the session (from first pane)
+    pub cwd: Option<String>,
 }
 
 /// Letter sequence for permission keys (avoiding 'r' for refresh, 'q' for quit, 'u' for unparked, 'p' for park)
