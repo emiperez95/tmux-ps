@@ -1138,6 +1138,19 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
         )));
     }
 
+    // --- Flags ---
+    let mut flag_spans: Vec<Span> = Vec::new();
+    if app.is_auto_approved(&session_info.name) {
+        flag_spans.push(Span::styled("[auto-approve] ", Style::default().fg(Color::Green)));
+    }
+    if app.is_muted(&session_info.name) {
+        flag_spans.push(Span::styled("[muted] ", Style::default().fg(Color::DarkGray)));
+    }
+    if !flag_spans.is_empty() {
+        flag_spans.insert(0, Span::styled("Flags: ", Style::default().add_modifier(Modifier::DIM)));
+        lines.push(Line::from(flag_spans));
+    }
+
     lines.push(Line::raw("")); // Spacing
 
     // --- Todos section ---
