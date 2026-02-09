@@ -2,9 +2,10 @@
 
 use crate::common::debug::debug_log;
 use crate::common::persistence::{
-    has_sesh_config, list_sesh_projects, load_auto_approve_sessions, load_parked_sessions,
-    load_session_todos, save_auto_approve_sessions, save_parked_sessions,
-    save_restorable_sessions, save_session_todos, sesh_connect,
+    has_sesh_config, is_globally_muted, list_sesh_projects, load_auto_approve_sessions,
+    load_muted_sessions, load_parked_sessions, load_session_todos, save_auto_approve_sessions,
+    save_muted_sessions, save_parked_sessions, save_restorable_sessions, save_session_todos,
+    set_global_mute, sesh_connect,
 };
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::tmux::{get_tmux_sessions, kill_tmux_session};
@@ -84,6 +85,9 @@ pub struct App {
     pub daemon_connected: bool,
     // Per-session auto-approve toggle
     pub auto_approve_sessions: HashSet<String>,
+    // Per-session notification mute
+    pub muted_sessions: HashSet<String>,
+    pub global_mute: bool,
 }
 
 impl App {
@@ -128,6 +132,8 @@ impl App {
             },
             daemon_connected,
             auto_approve_sessions: load_auto_approve_sessions(),
+            muted_sessions: load_muted_sessions(),
+            global_mute: is_globally_muted(),
         }
     }
 
@@ -709,6 +715,44 @@ impl App {
     /// Check if a session has auto-approve enabled
     pub fn is_auto_approved(&self, name: &str) -> bool {
         self.auto_approve_sessions.contains(name)
+    }
+
+    /// Toggle notification mute for a session by index
+    pub fn toggle_mute(&mut self, idx: usize) {
+        let Some(session_info) = self.session_infos.get(idx) else {
+            return;
+        };
+        let name = session_info.name.clone();
+        if self.muted_sessions.contains(&name) {
+            self.muted_sessions.remove(&name);
+            self.error_message = Some((
+                format!("Notifications ON for '{}'", name),
+                Instant::now(),
+            ));
+        } else {
+            self.muted_sessions.insert(name.clone());
+            self.error_message = Some((
+                format!("Notifications OFF for '{}'", name),
+                Instant::now(),
+            ));
+        }
+        save_muted_sessions(&self.muted_sessions);
+    }
+
+    /// Check if a session is muted
+    pub fn is_muted(&self, name: &str) -> bool {
+        self.muted_sessions.contains(name)
+    }
+
+    /// Toggle global mute
+    pub fn toggle_global_mute(&mut self) {
+        self.global_mute = !self.global_mute;
+        set_global_mute(self.global_mute);
+        if self.global_mute {
+            self.error_message = Some(("Global mute ON".to_string(), Instant::now()));
+        } else {
+            self.error_message = Some(("Global mute OFF".to_string(), Instant::now()));
+        }
     }
 }
 

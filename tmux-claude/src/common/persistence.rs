@@ -200,3 +200,65 @@ pub fn save_auto_approve_sessions(sessions: &HashSet<String>) {
         }
     }
 }
+
+/// Get the path to the muted sessions file
+pub fn get_muted_file_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|p| p.join("tmux-claude").join("muted.txt"))
+}
+
+/// Load muted session names from disk
+pub fn load_muted_sessions() -> HashSet<String> {
+    let Some(path) = get_muted_file_path() else {
+        return HashSet::new();
+    };
+    let Ok(file) = fs::File::open(&path) else {
+        return HashSet::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .collect()
+}
+
+/// Save muted session names to disk
+pub fn save_muted_sessions(sessions: &HashSet<String>) {
+    let Some(path) = get_muted_file_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::File::create(&path) {
+        for name in sessions {
+            let _ = writeln!(file, "{}", name);
+        }
+    }
+}
+
+/// Get the path to the global mute flag file
+pub fn get_global_mute_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|p| p.join("tmux-claude").join("muted-global"))
+}
+
+/// Check if global mute is enabled (file existence)
+pub fn is_globally_muted() -> bool {
+    get_global_mute_path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Set global mute state (creates or removes the flag file)
+pub fn set_global_mute(enabled: bool) {
+    let Some(path) = get_global_mute_path() else {
+        return;
+    };
+    if enabled {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::File::create(&path);
+    } else {
+        let _ = fs::remove_file(&path);
+    }
+}

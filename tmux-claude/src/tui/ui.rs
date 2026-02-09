@@ -69,21 +69,29 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         Span::styled("[standalone]", Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))
     };
 
-    let header = Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         mode_indicator,
-        Span::raw("  "),
-        Span::styled(
-            now.format("%H:%M:%S").to_string(),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("{}s refresh", app.interval),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-    ]);
+    ];
+    if app.global_mute {
+        header_spans.push(Span::raw("  "));
+        header_spans.push(Span::styled(
+            "[MUTED]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    header_spans.push(Span::raw("  "));
+    header_spans.push(Span::styled(
+        now.format("%H:%M:%S").to_string(),
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    header_spans.push(Span::raw("  "));
+    header_spans.push(Span::styled(
+        format!("{}s refresh", app.interval),
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    let header = Line::from(header_spans);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
     // --- Main content: session list, parked list, search, or detail view ---
@@ -160,6 +168,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("ark "),
             Span::styled("[!]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("auto "),
+            Span::styled("[M]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("ute "),
             Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("back "),
             Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
@@ -226,6 +236,11 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Style::default().add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw("efresh "));
+        spans.push(Span::styled(
+            "[M]",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("ute "));
         spans.push(Span::styled(
             "[Q]",
             Style::default().add_modifier(Modifier::BOLD),
@@ -736,6 +751,11 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 header_spans.push(Span::styled(" [auto]", Style::default().fg(Color::Green)));
             }
 
+            // Add muted badge
+            if app.is_muted(&session_info.name) {
+                header_spans.push(Span::styled(" [muted]", Style::default().fg(Color::DarkGray)));
+            }
+
             lines.push(Line::from(header_spans));
 
             // Status line
@@ -880,6 +900,11 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
             // Add auto-approve badge
             if app.is_auto_approved(&session_info.name) {
                 header_spans.push(Span::styled(" [auto]", Style::default().fg(Color::Green)));
+            }
+
+            // Add muted badge
+            if app.is_muted(&session_info.name) {
+                header_spans.push(Span::styled(" [muted]", Style::default().fg(Color::DarkGray)));
             }
 
             lines.push(Line::from(header_spans));

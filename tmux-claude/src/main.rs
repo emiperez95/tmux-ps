@@ -347,6 +347,7 @@ fn run_tui(
                                 if c.is_ascii_lowercase()
                                     && c != 'a'
                                     && c != 'd'
+                                    && c != 'm'
                                     && c != 'p' =>
                             {
                                 let idx = (c as u8 - b'a') as usize;
@@ -376,6 +377,13 @@ fn run_tui(
                                 // Toggle auto-approve for this session
                                 if let Some(idx) = app.showing_detail {
                                     app.toggle_auto_approve(idx);
+                                    needs_redraw = true;
+                                }
+                            }
+                            KeyCode::Char('m') | KeyCode::Char('M') => {
+                                // Toggle mute for this session
+                                if let Some(idx) = app.showing_detail {
+                                    app.toggle_mute(idx);
                                     needs_redraw = true;
                                 }
                             }
@@ -445,6 +453,10 @@ fn run_tui(
                             KeyCode::Char('r') | KeyCode::Char('R') => {
                                 should_refresh = true;
                                 break;
+                            }
+                            KeyCode::Char('m') | KeyCode::Char('M') => {
+                                app.toggle_global_mute();
+                                needs_redraw = true;
                             }
                             KeyCode::Char('q') | KeyCode::Char('Q') => {
                                 app.save_restorable();
