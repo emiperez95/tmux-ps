@@ -198,24 +198,6 @@ fn run_tui(
                             }
                             _ => {}
                         }
-                    } else if app.awaiting_park_number {
-                        // Handle park number input
-                        match code {
-                            KeyCode::Esc => {
-                                app.awaiting_park_number = false;
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                                let idx = c.to_digit(10).unwrap() as usize - 1;
-                                app.awaiting_park_number = false;
-                                app.start_park_session(idx);
-                                needs_redraw = true;
-                            }
-                            _ => {
-                                app.awaiting_park_number = false;
-                                needs_redraw = true;
-                            }
-                        }
                     } else if app.input_mode == InputMode::ParkNote {
                         // Handle note input for parking
                         match code {
@@ -486,11 +468,6 @@ fn run_tui(
                                     app.open_detail(app.selected);
                                     needs_redraw = true;
                                 }
-                            }
-                            // P: enter park mode (wait for number)
-                            KeyCode::Char('p') | KeyCode::Char('P') => {
-                                app.awaiting_park_number = true;
-                                needs_redraw = true;
                             }
                             // U: show parked view
                             KeyCode::Char('u') | KeyCode::Char('U') => {

@@ -54,7 +54,6 @@ pub struct App {
     pub showing_parked: bool,
     pub parked_selected: usize,
     pub error_message: Option<(String, Instant)>,
-    pub awaiting_park_number: bool,
     // Text input (park note or add todo)
     pub input_mode: InputMode,
     pub input_buffer: String,
@@ -121,7 +120,6 @@ impl App {
             showing_parked: false,
             parked_selected: 0,
             error_message: None,
-            awaiting_park_number: false,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             pending_park_session: None,

@@ -199,13 +199,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::styled("[Q]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("uit"),
         ])
-    } else if app.awaiting_park_number {
-        Line::from(vec![
-            Span::styled("[1-9]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("park session "),
-            Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("cancel"),
-        ])
     } else {
         let parked_count = app.parked_sessions.len();
         let mut spans = vec![
@@ -215,8 +208,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("detail "),
             Span::styled("[1-9]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("switch "),
-            Span::styled("[P+#]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("ark "),
         ];
         if parked_count > 0 {
             spans.push(Span::styled(
@@ -719,8 +710,6 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
         let display_num = idx + 1;
         let is_selected = app.show_selection && idx == app.selected;
-        let is_pending_park =
-            app.input_mode == InputMode::ParkNote && app.pending_park_session == Some(idx);
 
         // CPU styling
         let cpu_text = format!("{:.1}%", session_info.total_cpu);
@@ -742,15 +731,8 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
             Color::Red
         };
 
-        // Prefix: ">" for selected, "P" for pending park, number for others
-        let prefix_span = if is_pending_park {
-            Span::styled(
-                "P",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else if is_selected {
+        // Prefix: ">" for selected, number for others
+        let prefix_span = if is_selected {
             Span::styled(">", Style::default().add_modifier(Modifier::BOLD))
         } else if display_num <= 9 {
             Span::styled(
@@ -763,9 +745,7 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
         if is_claude {
             // --- Claude session: 3 lines (header + status + blank) ---
-            let header_style = if is_pending_park {
-                Style::default().fg(Color::Yellow)
-            } else if is_selected {
+            let header_style = if is_selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else if is_skipped {
                 Style::default().add_modifier(Modifier::DIM)
@@ -919,9 +899,7 @@ pub fn render_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
             }
         } else {
             // --- Non-Claude session: 1 dim line ---
-            let header_style = if is_pending_park {
-                Style::default().fg(Color::Yellow)
-            } else if is_selected {
+            let header_style = if is_selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default().add_modifier(Modifier::DIM)
