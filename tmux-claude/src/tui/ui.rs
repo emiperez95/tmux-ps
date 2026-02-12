@@ -11,7 +11,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols::Marker,
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph},
+    widgets::{Axis, Block, Borders, Chart, Clear, Dataset, GraphType, Paragraph},
     Frame,
 };
 
@@ -100,6 +100,11 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         render_search_view(frame, app, chunks[1]);
     } else if app.showing_detail.is_some() {
         render_detail_view(frame, app, chunks[1]);
+        if app.input_mode == InputMode::ParkNote {
+            render_input_modal(frame, app, chunks[1], "Park", "park", Color::Yellow);
+        } else if app.input_mode == InputMode::AddTodo {
+            render_input_modal(frame, app, chunks[1], "Add Todo", "add", Color::Cyan);
+        }
     } else if app.showing_parked_detail.is_some() {
         render_parked_detail_view(frame, app, chunks[1]);
     } else if app.showing_parked {
@@ -131,30 +136,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("select "),
             Span::styled("[Esc]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("cancel"),
-        ])
-    } else if app.input_mode == InputMode::AddTodo {
-        // Todo input mode footer
-        Line::from(vec![
-            Span::styled("Todo: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(&app.input_buffer),
-            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
-            Span::raw("  "),
-            Span::styled("[Enter]", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled("add ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled("[Esc]", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled("cancel", Style::default().add_modifier(Modifier::DIM)),
-        ])
-    } else if app.input_mode == InputMode::ParkNote {
-        // Note input mode footer
-        Line::from(vec![
-            Span::styled("Note: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(&app.input_buffer),
-            Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
-            Span::raw("  "),
-            Span::styled("[Enter]", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled("park ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled("[Esc]", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled("cancel", Style::default().add_modifier(Modifier::DIM)),
         ])
     } else if app.showing_detail.is_some() {
         // Detail view footer
@@ -983,14 +964,18 @@ pub fn render_parked_view(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(name.clone(), style),
             ]));
 
-            // Show note on next line if present
+            // Show note on next line(s) if present
             if !note.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("   → {}", note),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::DIM),
-                )));
+                let note_style = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::DIM);
+                for (j, note_line) in note.split('\n').enumerate() {
+                    let prefix = if j == 0 { "   → " } else { "     " };
+                    lines.push(Line::from(Span::styled(
+                        format!("{}{}", prefix, note_line),
+                        note_style,
+                    )));
+                }
             }
         }
     }
@@ -1072,16 +1057,20 @@ pub fn render_search_view(frame: &mut Frame, app: &mut App, area: Rect) {
                     ]));
                     lines_remaining -= 1;
 
-                    // Show note on next line if present
+                    // Show note on next line(s) if present
                     if has_note {
                         if let Some(note) = app.parked_sessions.get(name) {
-                            lines.push(Line::from(Span::styled(
-                                format!("   → {}", note),
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::DIM),
-                            )));
-                            lines_remaining -= 1;
+                            let note_style = Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::DIM);
+                            for (j, note_line) in note.split('\n').enumerate() {
+                                let prefix = if j == 0 { "   → " } else { "     " };
+                                lines.push(Line::from(Span::styled(
+                                    format!("{}{}", prefix, note_line),
+                                    note_style,
+                                )));
+                                lines_remaining -= 1;
+                            }
                         }
                     }
                 }
@@ -1216,12 +1205,22 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default()
             };
 
+            // Handle multiline todos
+            let todo_lines: Vec<&str> = todo.split('\n').collect();
+            // First line with prefix
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 prefix,
                 Span::styled(". ", style),
-                Span::styled(todo.clone(), style),
+                Span::styled(todo_lines[0].to_string(), style),
             ]));
+            // Continuation lines indented
+            for cont_line in &todo_lines[1..] {
+                lines.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(cont_line.to_string(), style),
+                ]));
+            }
         }
     }
 
@@ -1317,6 +1316,92 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     frame.render_widget(Paragraph::new(visible_lines), area);
+}
+
+/// Render a multiline input modal overlay (used for park notes and todos)
+fn render_input_modal(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    title: &str,
+    submit_label: &str,
+    border_color: Color,
+) {
+    let session_name = app
+        .detail_session_name()
+        .unwrap_or_else(|| "session".to_string());
+
+    // Split input into lines for multiline display
+    let input_lines: Vec<&str> = app.input_buffer.split('\n').collect();
+    let num_input_lines = input_lines.len().max(1);
+
+    // Modal size: 60 chars wide, height adapts to content
+    // 2 (border) + input lines + 1 (blank) + 1 (instructions) = min 5
+    let modal_width = (area.width.saturating_sub(4)).min(60).max(40);
+    let modal_height = (num_input_lines as u16 + 4).min(area.height.saturating_sub(2));
+
+    // Center the modal
+    let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
+    let modal_area = Rect::new(x, y, modal_width, modal_height);
+
+    // Clear the area behind the modal
+    frame.render_widget(Clear, modal_area);
+
+    // Build the block with title
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(format!(" {}: {} ", title, session_name));
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    // Inner content: input lines + instructions
+    let inner_width = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Render each input line, with cursor on the last one
+    for (i, line_text) in input_lines.iter().enumerate() {
+        let is_last = i == input_lines.len() - 1;
+        let max_visible = inner_width.saturating_sub(1); // -1 for cursor on last line
+
+        let visible = if line_text.len() > max_visible {
+            &line_text[line_text.len() - max_visible..]
+        } else {
+            line_text
+        };
+
+        if is_last {
+            lines.push(Line::from(vec![
+                Span::raw(visible),
+                Span::styled(
+                    "█",
+                    Style::default().add_modifier(Modifier::SLOW_BLINK),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(Span::raw(visible)));
+        }
+    }
+
+    // Blank line before instructions
+    lines.push(Line::raw(""));
+
+    // Instructions line
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(
+            format!(" {}  ", submit_label),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled("[Alt+Enter]", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(" newline  ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("[Esc]", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(" cancel", Style::default().add_modifier(Modifier::DIM)),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Render the parked session detail view

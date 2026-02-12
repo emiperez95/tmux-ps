@@ -6,6 +6,33 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Escape newlines for single-line file storage
+fn escape_newlines(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+/// Unescape newlines from file storage
+fn unescape_newlines(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('\\') => result.push('\\'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Get the path to the parked sessions file
 pub fn get_parked_file_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|p| p.join("tmux-claude").join("parked.txt"))
@@ -26,7 +53,7 @@ pub fn load_parked_sessions() -> HashMap<String, String> {
         .map(|line| {
             // Format: "session-name\tnote" or just "session-name" (for backwards compat)
             if let Some((name, note)) = line.split_once('\t') {
-                (name.to_string(), note.to_string())
+                (name.to_string(), unescape_newlines(note))
             } else {
                 (line, String::new())
             }
@@ -44,7 +71,7 @@ pub fn save_parked_sessions(parked: &HashMap<String, String>) {
     }
     if let Ok(mut file) = fs::File::create(&path) {
         for (name, note) in parked {
-            let _ = writeln!(file, "{}\t{}", name, note);
+            let _ = writeln!(file, "{}\t{}", name, escape_newlines(note));
         }
     }
 }
@@ -72,7 +99,7 @@ pub fn load_session_todos() -> HashMap<String, Vec<String>> {
             todos
                 .entry(name.to_string())
                 .or_default()
-                .push(todo.to_string());
+                .push(unescape_newlines(todo));
         }
     }
     todos
@@ -89,7 +116,7 @@ pub fn save_session_todos(todos: &HashMap<String, Vec<String>>) {
     if let Ok(mut file) = fs::File::create(&path) {
         for (name, items) in todos {
             for item in items {
-                let _ = writeln!(file, "{}\t{}", name, item);
+                let _ = writeln!(file, "{}\t{}", name, escape_newlines(item));
             }
         }
     }

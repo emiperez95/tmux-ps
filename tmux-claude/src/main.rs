@@ -7,7 +7,7 @@ mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use crossterm::event::{poll, read, Event, KeyCode, KeyEvent};
+use crossterm::event::{poll, read, Event, KeyCode, KeyEvent, KeyModifiers};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -145,7 +145,7 @@ fn run_tui(
             }
 
             if poll(Duration::from_millis(sleep_ms))? {
-                if let Event::Key(KeyEvent { code, .. }) = read()? {
+                if let Event::Key(KeyEvent { code, modifiers, .. }) = read()? {
                     debug_log(&format!(
                         "KEY: {:?} (mode={:?}, showing_parked={}, showing_detail={:?})",
                         code,
@@ -205,6 +205,12 @@ fn run_tui(
                                 app.cancel_park_input();
                                 needs_redraw = true;
                             }
+                            KeyCode::Enter
+                                if modifiers.contains(KeyModifiers::ALT) =>
+                            {
+                                app.input_buffer.push('\n');
+                                needs_redraw = true;
+                            }
                             KeyCode::Enter => {
                                 app.complete_park_session();
                                 should_refresh = true;
@@ -225,6 +231,12 @@ fn run_tui(
                         match code {
                             KeyCode::Esc => {
                                 app.cancel_add_todo();
+                                needs_redraw = true;
+                            }
+                            KeyCode::Enter
+                                if modifiers.contains(KeyModifiers::ALT) =>
+                            {
+                                app.input_buffer.push('\n');
                                 needs_redraw = true;
                             }
                             KeyCode::Enter => {
@@ -389,9 +401,8 @@ fn run_tui(
                                 }
                             }
                             KeyCode::Char('p') | KeyCode::Char('P') => {
-                                // Park this session
+                                // Park this session (stays in detail view, shows modal)
                                 if let Some(idx) = app.showing_detail {
-                                    app.close_detail();
                                     app.start_park_session(idx);
                                     needs_redraw = true;
                                 }

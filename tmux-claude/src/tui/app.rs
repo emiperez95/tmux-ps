@@ -544,6 +544,8 @@ impl App {
                 if kill_tmux_session(&name) {
                     self.parked_sessions.insert(name.clone(), note);
                     save_parked_sessions(&self.parked_sessions);
+                    // Close detail view since the session was killed
+                    self.showing_detail = None;
                 } else {
                     self.error_message = Some((
                         format!("Failed to kill session '{}'", name),
