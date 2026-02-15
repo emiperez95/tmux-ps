@@ -8,6 +8,7 @@ use crate::common::persistence::{
     save_restorable_sessions, save_session_todos, save_skipped_sessions, set_global_mute,
     sesh_connect,
 };
+use crate::common::ports::get_listening_ports_for_pids;
 use crate::common::process::{get_all_descendants, get_process_info, is_claude_process};
 use crate::common::tmux::{get_tmux_sessions, kill_tmux_session};
 use crate::common::types::{
@@ -94,6 +95,8 @@ pub struct App {
     pub skipped_sessions: HashSet<String>,
     // Auto-open detail view on first refresh
     pub auto_detail: bool,
+    // Chrome tabs matched to the currently viewed detail session's ports
+    pub detail_chrome_tabs: Vec<(crate::common::chrome::ChromeTab, u16)>,
 }
 
 impl App {
@@ -148,6 +151,7 @@ impl App {
             global_mute: is_globally_muted(),
             skipped_sessions: load_skipped_sessions(),
             auto_detail: false,
+            detail_chrome_tabs: Vec::new(),
         }
     }
 
@@ -326,6 +330,9 @@ impl App {
             // Sort processes by CPU descending
             processes.sort_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(std::cmp::Ordering::Equal));
 
+            // Detect listening ports for all PIDs in this session
+            let listening_ports = get_listening_ports_for_pids(&all_pids, &self.sys);
+
             // Find Claude pane: check daemon state by cwd, or detect Claude process
             let mut claude_status: Option<ClaudeStatus> = None;
             let mut claude_pane: Option<(String, String, String)> = None;
@@ -375,6 +382,7 @@ impl App {
                 last_activity,
                 processes,
                 cwd: session_cwd,
+                listening_ports,
             });
         }
 
@@ -442,6 +450,21 @@ impl App {
         }
 
         self.session_infos = session_infos;
+
+        // Fetch Chrome tabs for detail view (only when detail is open and session has ports)
+        if let Some(idx) = self.showing_detail {
+            if let Some(session) = self.session_infos.get(idx) {
+                if !session.listening_ports.is_empty() {
+                    let all_tabs = crate::common::chrome::get_chrome_tabs();
+                    self.detail_chrome_tabs =
+                        crate::common::chrome::match_tabs_to_ports(&all_tabs, &session.listening_ports);
+                } else {
+                    self.detail_chrome_tabs.clear();
+                }
+            }
+        } else {
+            self.detail_chrome_tabs.clear();
+        }
 
         // Debug log refresh summary
         if crate::common::debug::is_debug_enabled() {
@@ -629,6 +652,7 @@ impl App {
         self.detail_scroll_offset = 0;
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
+        self.detail_chrome_tabs.clear();
     }
 
     /// Get the session name for the current detail view

@@ -1,5 +1,6 @@
 //! Core types used throughout the application.
 
+use crate::common::ports::ListeningPort;
 use chrono::{DateTime, Utc};
 
 /// tmux pane information
@@ -84,6 +85,8 @@ pub struct SessionInfo {
     pub processes: Vec<ProcessInfo>,
     /// Working directory of the session (from first pane)
     pub cwd: Option<String>,
+    /// Listening TCP ports in this session's process tree
+    pub listening_ports: Vec<ListeningPort>,
 }
 
 /// Letter sequence for permission keys (avoiding 'r' for refresh, 'q' for quit, 'u' for unparked, 'p' for park)

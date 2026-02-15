@@ -1173,19 +1173,14 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
 
     lines.push(Line::raw("")); // Spacing
 
-    // --- Todos section ---
-    lines.push(Line::from(Span::styled(
-        "Todos:",
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-
+    // --- Todos section (only if non-empty) ---
     let todos = app.detail_todos();
-    if todos.is_empty() {
+    if !todos.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  (no todos)",
-            Style::default().add_modifier(Modifier::DIM),
+            "Todos:",
+            Style::default().add_modifier(Modifier::BOLD),
         )));
-    } else {
+
         for (i, todo) in todos.iter().enumerate() {
             let letter = (b'a' + i as u8) as char;
             let is_selected = i == app.detail_selected;
@@ -1222,9 +1217,72 @@ pub fn render_detail_view(frame: &mut Frame, app: &mut App, area: Rect) {
                 ]));
             }
         }
+
+        lines.push(Line::raw("")); // Spacing
     }
 
-    lines.push(Line::raw("")); // Spacing
+    // --- Ports section (only if non-empty) ---
+    // Ports are selectable: detail_selected indexes todos first, then ports
+    let listening_ports = &session_info.listening_ports;
+    let port_selection_offset = todos.len(); // ports start after todos in selection index
+    if !listening_ports.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Ports:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+
+        for (i, port_info) in listening_ports.iter().enumerate() {
+            let sel_idx = port_selection_offset + i;
+            let is_selected = sel_idx == app.detail_selected;
+
+            let port_label = format!(":{:<5}  ({})", port_info.port, port_info.process_name);
+
+            // Check if a Chrome tab matches this port
+            let tab_match = app
+                .detail_chrome_tabs
+                .iter()
+                .find(|(_, p)| *p == port_info.port);
+
+            let style = if is_selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+
+            let prefix = if is_selected {
+                Span::styled(">", Style::default().add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw(" ")
+            };
+
+            if let Some((tab, _)) = tab_match {
+                // Truncate tab title to fit
+                let max_title = (area.width as usize).saturating_sub(port_label.len() + 8);
+                let title = if tab.title.len() > max_title {
+                    format!("{}...", &tab.title[..max_title.saturating_sub(3)])
+                } else {
+                    tab.title.clone()
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    prefix,
+                    Span::styled(format!(" {}", port_label), style),
+                    Span::styled(
+                        format!(" → {}", title),
+                        if is_selected { style } else { Style::default().fg(Color::Cyan) },
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    prefix,
+                    Span::styled(format!(" {}", port_label), style),
+                ]));
+            }
+        }
+
+        lines.push(Line::raw("")); // Spacing
+    }
 
     // --- Processes section ---
     lines.push(Line::from(Span::styled(

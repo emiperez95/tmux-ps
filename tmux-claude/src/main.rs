@@ -351,7 +351,11 @@ fn run_tui(
                                 needs_redraw = true;
                             }
                             KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Backspace => {
-                                app.delete_selected_todo();
+                                // Only delete if a todo is selected (not a port)
+                                let todo_count = app.detail_todos().len();
+                                if app.detail_selected < todo_count {
+                                    app.delete_selected_todo();
+                                }
                                 needs_redraw = true;
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
@@ -363,41 +367,57 @@ fn run_tui(
                                 needs_redraw = true;
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
-                                let count = app.detail_todos().len();
-                                if count > 0 && app.detail_selected < count - 1 {
+                                let todo_count = app.detail_todos().len();
+                                let port_count = app.showing_detail
+                                    .and_then(|idx| app.session_infos.get(idx))
+                                    .map(|s| s.listening_ports.len())
+                                    .unwrap_or(0);
+                                let total = todo_count + port_count;
+                                if total > 0 && app.detail_selected < total - 1 {
                                     app.detail_selected += 1;
                                 } else {
-                                    // Scroll down when at bottom of todo list
+                                    // Scroll down when at bottom of selectable items
                                     app.detail_scroll_offset += 1;
                                 }
                                 needs_redraw = true;
                             }
-                            // Letter keys (a-z) to select todo (except a/d/p which are actions)
-                            KeyCode::Char(c)
-                                if c.is_ascii_lowercase()
-                                    && c != 'a'
-                                    && c != 'd'
-                                    && c != 'm'
-                                    && c != 'p'
-                                    && c != 's' =>
-                            {
-                                let idx = (c as u8 - b'a') as usize;
-                                let count = app.detail_todos().len();
-                                if idx < count {
-                                    app.detail_selected = idx;
-                                    needs_redraw = true;
-                                }
-                            }
                             KeyCode::Enter => {
-                                // Switch to this session
-                                if let Some(name) = app.detail_session_name() {
-                                    switch_to_session(&name);
-                                    if app.popup_mode {
-                                        app.save_restorable();
-                                        return Ok(());
+                                let todo_count = app.detail_todos().len();
+                                let port_count = app.showing_detail
+                                    .and_then(|idx| app.session_infos.get(idx))
+                                    .map(|s| s.listening_ports.len())
+                                    .unwrap_or(0);
+                                if app.detail_selected >= todo_count && port_count > 0 {
+                                    // Port selected — focus existing tab or open new one
+                                    let port_idx = app.detail_selected - todo_count;
+                                    if let Some(session) = app.showing_detail
+                                        .and_then(|idx| app.session_infos.get(idx))
+                                    {
+                                        if let Some(port_info) = session.listening_ports.get(port_idx) {
+                                            // Try to focus an existing matched Chrome tab
+                                            let matched_tab = app.detail_chrome_tabs.iter()
+                                                .find(|(_, p)| *p == port_info.port);
+                                            if let Some((tab, _)) = matched_tab {
+                                                crate::common::chrome::focus_chrome_tab(tab);
+                                            } else {
+                                                // No existing tab — open new one
+                                                let url = format!("http://localhost:{}", port_info.port);
+                                                crate::common::chrome::open_chrome_tab(&url);
+                                            }
+                                        }
                                     }
-                                    app.close_detail();
                                     needs_redraw = true;
+                                } else {
+                                    // Todo selected or no selectable items — switch to session
+                                    if let Some(name) = app.detail_session_name() {
+                                        switch_to_session(&name);
+                                        if app.popup_mode {
+                                            app.save_restorable();
+                                            return Ok(());
+                                        }
+                                        app.close_detail();
+                                        needs_redraw = true;
+                                    }
                                 }
                             }
                             KeyCode::Char('p') | KeyCode::Char('P') => {
