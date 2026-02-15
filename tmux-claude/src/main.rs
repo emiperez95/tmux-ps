@@ -338,11 +338,7 @@ fn run_tui(
                     } else if app.showing_detail.is_some() {
                         // Handle detail view input
                         match code {
-                            KeyCode::Esc => {
-                                app.close_detail();
-                                needs_redraw = true;
-                            }
-                            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                                 app.save_restorable();
                                 return Ok(());
                             }
